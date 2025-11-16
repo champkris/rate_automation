@@ -108,9 +108,9 @@ foreach ($excelFiles as $excelFile) {
             }
         }
     } else {
-        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T)
-        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T
-        // Note: Columns D, G, H, I, J may have merged cells that need to be handled
+        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T), L (REMARK)
+        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | ... | REMARK
+        // Note: Columns D, G, H, I, J, L may have merged cells that need to be handled
 
         // First, build a map of merged cell values
         $mergedCellValues = [];
@@ -146,6 +146,7 @@ foreach ($excelFiles as $excelFile) {
             $pol = trim($getCellValue('D', $row) ?? '');
             $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
             $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
+            $remark = trim($getCellValue('L', $row) ?? '');  // REMARK from column L
 
             // Add "Days" suffix to T/T if not empty
             if (!empty($tt)) {
@@ -187,7 +188,7 @@ foreach ($excelFiles as $excelFile) {
                 'T/S' => $ts,
                 'FREE TIME' => '',
                 'VALIDITY' => 'NOV 2025',
-                'REMARK' => $country,
+                'REMARK' => $remark,
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
