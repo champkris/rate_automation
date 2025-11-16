@@ -108,9 +108,9 @@ foreach ($excelFiles as $excelFile) {
             }
         }
     } else {
-        // RCL format: starts at row 10, columns B (POD), G (20'), H (40')
-        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC
-        // Note: Columns D, G, H may have merged cells that need to be handled
+        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T)
+        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T
+        // Note: Columns D, G, H, I, J may have merged cells that need to be handled
 
         // First, build a map of merged cell values
         $mergedCellValues = [];
@@ -144,6 +144,8 @@ foreach ($excelFiles as $excelFile) {
             $pod = trim($getCellValue('B', $row) ?? '');
             $podCode = trim($getCellValue('C', $row) ?? '');
             $pol = trim($getCellValue('D', $row) ?? '');
+            $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
+            $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
             $rate20 = $getCellValue('G', $row);
             $rate40 = $getCellValue('H', $row);
 
@@ -175,8 +177,8 @@ foreach ($excelFiles as $excelFile) {
                 '40RF' => '',
                 'ETD BKK' => '',
                 'ETD LCH' => '',
-                'T/T' => '',
-                'T/S' => '',
+                'T/T' => $tt,
+                'T/S' => $ts,
                 'FREE TIME' => '',
                 'VALIDITY' => 'NOV 2025',
                 'REMARK' => $country,
