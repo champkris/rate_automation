@@ -146,6 +146,12 @@ foreach ($excelFiles as $excelFile) {
             $pol = trim($getCellValue('D', $row) ?? '');
             $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
             $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
+
+            // Add "Days" suffix to T/T if not empty
+            if (!empty($tt)) {
+                $tt .= ' Days';
+            }
+
             $rate20 = $getCellValue('G', $row);
             $rate40 = $getCellValue('H', $row);
 
