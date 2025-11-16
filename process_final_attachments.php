@@ -108,9 +108,9 @@ foreach ($excelFiles as $excelFile) {
             }
         }
     } else {
-        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T), L (REMARK)
-        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | ... | REMARK
-        // Note: Columns D, G, H, I, J, L may have merged cells that need to be handled
+        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T), K (FREE TIME), L (REMARK)
+        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | FREE TIME | REMARK
+        // Note: Columns D, G, H, I, J, K, L may have merged cells that need to be handled
 
         // First, build a map of merged cell values
         $mergedCellValues = [];
@@ -146,6 +146,7 @@ foreach ($excelFiles as $excelFile) {
             $pol = trim($getCellValue('D', $row) ?? '');
             $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
             $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
+            $freeTime = trim($getCellValue('K', $row) ?? '');  // FREE TIME from column K
             $remark = trim($getCellValue('L', $row) ?? '');  // REMARK from column L
 
             // Add "Days" suffix to T/T if not empty
@@ -186,7 +187,7 @@ foreach ($excelFiles as $excelFile) {
                 'ETD LCH' => '',
                 'T/T' => $tt,
                 'T/S' => $ts,
-                'FREE TIME' => '',
+                'FREE TIME' => $freeTime,
                 'VALIDITY' => 'NOV 2025',
                 'REMARK' => $remark,
                 'Export' => '',
