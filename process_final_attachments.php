@@ -148,6 +148,7 @@ foreach ($excelFiles as $excelFile) {
             $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
             $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
             $freeTime = trim($getCellValue('K', $row) ?? '');  // FREE TIME from column K
+            $remarkColumnL = trim($getCellValue('L', $row) ?? '');  // REMARK from column L
 
             // Add "Days" suffix to T/T if not empty
             if (!empty($tt)) {
@@ -174,12 +175,16 @@ foreach ($excelFiles as $excelFile) {
             // Process ETD dates from column F
             $etdBkk = '';
             $etdLch = '';
-            $remark = '';
+            $remark = $remarkColumnL;  // Start with value from column L
 
             if (!empty($etdColumnF)) {
-                // Check for SSW and extract to REMARK
+                // Check for SSW - append to REMARK if exists
                 if (stripos($etdColumnF, 'SSW') !== false) {
-                    $remark = 'SSW';
+                    if (!empty($remark)) {
+                        $remark .= ' / SSW';
+                    } else {
+                        $remark = 'SSW';
+                    }
                 }
 
                 // Split by common delimiters to detect multiple dates
