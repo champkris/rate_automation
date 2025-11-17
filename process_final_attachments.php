@@ -174,12 +174,23 @@ foreach ($excelFiles as $excelFile) {
             // Process ETD dates from column F
             $etdBkk = '';
             $etdLch = '';
+            $remark = '';
 
             if (!empty($etdColumnF)) {
+                // Check for SSW and extract to REMARK
+                if (stripos($etdColumnF, 'SSW') !== false) {
+                    $remark = 'SSW';
+                }
+
                 // Split by common delimiters to detect multiple dates
                 $dates = preg_split('/[\n\r\/,]+/', $etdColumnF);
                 $dates = array_map('trim', $dates);
                 $dates = array_filter($dates); // Remove empty values
+
+                // Filter out SSW from dates array
+                $dates = array_filter($dates, function($date) {
+                    return stripos($date, 'SSW') === false;
+                });
 
                 if (count($dates) >= 2) {
                     // Multiple dates found
@@ -264,7 +275,7 @@ foreach ($excelFiles as $excelFile) {
                 'T/S' => $ts,
                 'FREE TIME' => $freeTime,
                 'VALIDITY' => 'NOV 2025',
-                'REMARK' => '',
+                'REMARK' => $remark,
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
