@@ -9,6 +9,42 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 ini_set('memory_limit', '1024M');
 set_time_limit(600);
 
+// Helper function to format validity date
+function formatValidity($validityRaw) {
+    // Default return if invalid
+    if (empty($validityRaw)) {
+        return 'NOV 2025';
+    }
+
+    // Month names
+    $months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    // Check if it's a date range (e.g., "01/11-15/11" or "01/11-30/11/2025")
+    if (strpos($validityRaw, '-') !== false) {
+        // Split by "-" to get the end date
+        $parts = explode('-', $validityRaw);
+        $endDate = trim($parts[1]);
+
+        // Parse end date: could be "15/11" or "30/11/2025"
+        $dateParts = explode('/', $endDate);
+
+        if (count($dateParts) >= 2) {
+            $day = intval($dateParts[0]);
+            $month = intval($dateParts[1]);
+            $year = isset($dateParts[2]) ? intval($dateParts[2]) : 2025;
+
+            // Validate month
+            if ($month >= 1 && $month <= 12) {
+                $monthName = $months[$month - 1];
+                return sprintf('%02d %s %d', $day, $monthName, $year);
+            }
+        }
+    }
+
+    // If not a range or parsing failed, return original
+    return $validityRaw;
+}
+
 echo str_repeat('=', 100) . "\n";
 echo "PROCESSING FINAL ATTACHMENTS FROM /docs/attachmnts\n";
 echo str_repeat('=', 100) . "\n\n";
@@ -113,7 +149,10 @@ foreach ($excelFiles as $excelFile) {
         // Note: Columns D, F, G, H, I, J, K may have merged cells that need to be handled
 
         // Extract VALIDITY from cell B6
-        $validity = trim($worksheet->getCell('B6')->getValue() ?? 'NOV 2025');
+        $validityRaw = trim($worksheet->getCell('B6')->getValue() ?? 'NOV 2025');
+
+        // Convert validity to readable format (e.g., "01/11-15/11" -> "15 Nov 2025")
+        $validity = formatValidity($validityRaw);
 
         // First, build a map of merged cell values
         $mergedCellValues = [];
