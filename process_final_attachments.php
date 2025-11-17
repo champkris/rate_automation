@@ -108,9 +108,9 @@ foreach ($excelFiles as $excelFile) {
             }
         }
     } else {
-        // RCL format: starts at row 10, columns B (POD), D (POL), G (20'), H (40'), I (T/S), J (T/T), K (FREE TIME), L (REMARK)
-        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | FREE TIME | REMARK
-        // Note: Columns D, G, H, I, J, K, L may have merged cells that need to be handled
+        // RCL format: starts at row 10, columns B (POD), D (POL), F (ETD LCH), G (20'), H (40'), I (T/S), J (T/T), K (FREE TIME)
+        // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | FREE TIME | ...
+        // Note: Columns D, F, G, H, I, J, K may have merged cells that need to be handled
 
         // First, build a map of merged cell values
         $mergedCellValues = [];
@@ -144,10 +144,10 @@ foreach ($excelFiles as $excelFile) {
             $pod = trim($getCellValue('B', $row) ?? '');
             $podCode = trim($getCellValue('C', $row) ?? '');
             $pol = trim($getCellValue('D', $row) ?? '');
+            $etdColumnF = trim($getCellValue('F', $row) ?? '');  // ETD from column F
             $ts = trim($getCellValue('I', $row) ?? '');   // T/S (Transshipment)
             $tt = trim($getCellValue('J', $row) ?? '');   // T/T (Transit Time)
             $freeTime = trim($getCellValue('K', $row) ?? '');  // FREE TIME from column K
-            $remark = trim($getCellValue('L', $row) ?? '');  // REMARK from column L
 
             // Add "Days" suffix to T/T if not empty
             if (!empty($tt)) {
@@ -171,6 +171,81 @@ foreach ($excelFiles as $excelFile) {
                 continue;
             }
 
+            // Process ETD dates from column F
+            $etdBkk = '';
+            $etdLch = '';
+
+            if (!empty($etdColumnF)) {
+                // Split by common delimiters to detect multiple dates
+                $dates = preg_split('/[\n\r\/,]+/', $etdColumnF);
+                $dates = array_map('trim', $dates);
+                $dates = array_filter($dates); // Remove empty values
+
+                if (count($dates) >= 2) {
+                    // Multiple dates found
+                    // Collect dates for BKK and LCH separately
+                    // A date can belong to both if it contains both indicators
+                    $bkkDates = [];
+                    $lchDates = [];
+
+                    foreach ($dates as $date) {
+                        $hasBkk = preg_match('/(PAT|BKK)/i', $date);
+                        $hasLch = preg_match('/LCH/i', $date);
+
+                        if ($hasBkk && $hasLch) {
+                            // Date has both BKK and LCH indicators
+                            // Extract just the day name (e.g., "MON" from "MON (BKK PAT & LCH)")
+                            if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
+                                $dayName = $matches[1];
+                                $bkkDates[] = $dayName;
+                                $lchDates[] = $dayName;
+                            } else {
+                                $bkkDates[] = $date;
+                                $lchDates[] = $date;
+                            }
+                        } elseif ($hasBkk) {
+                            // Only BKK/PAT indicator
+                            if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
+                                $bkkDates[] = $matches[1];
+                            } else {
+                                $bkkDates[] = $date;
+                            }
+                        } elseif ($hasLch) {
+                            // Only LCH indicator
+                            if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
+                                $lchDates[] = $matches[1];
+                            } else {
+                                $lchDates[] = $date;
+                            }
+                        } else {
+                            // No specific indicator - default to LCH
+                            if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
+                                $lchDates[] = $matches[1];
+                            } else {
+                                $lchDates[] = $date;
+                            }
+                        }
+                    }
+
+                    // Join dates with "/"
+                    $etdBkk = !empty($bkkDates) ? implode('/', $bkkDates) : '';
+                    $etdLch = !empty($lchDates) ? implode('/', $lchDates) : '';
+                } elseif (count($dates) === 1) {
+                    // Single date found - check POL to determine which ETD column
+                    $singleDate = $dates[0];
+
+                    // Check if POL indicates LCH or BKK
+                    if (stripos($pol, 'LCH') !== false || stripos($pol, 'LAEM CHABANG') !== false) {
+                        $etdLch = $singleDate;
+                    } elseif (stripos($pol, 'BKK') !== false || stripos($pol, 'BANGKOK') !== false) {
+                        $etdBkk = $singleDate;
+                    } else {
+                        // Default to LCH if POL is ambiguous
+                        $etdLch = $singleDate;
+                    }
+                }
+            }
+
             // Create rate entry
             $rate = [
                 'CARRIER' => $carrier,
@@ -183,13 +258,13 @@ foreach ($excelFiles as $excelFile) {
                 '20 TC' => '',
                 '20 RF' => '',
                 '40RF' => '',
-                'ETD BKK' => '',
-                'ETD LCH' => '',
+                'ETD BKK' => $etdBkk,
+                'ETD LCH' => $etdLch,
                 'T/T' => $tt,
                 'T/S' => $ts,
                 'FREE TIME' => $freeTime,
                 'VALIDITY' => 'NOV 2025',
-                'REMARK' => $remark,
+                'REMARK' => '',
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
@@ -309,6 +384,13 @@ echo "  → Removed $duplicateCount duplicates\n";
 echo "  ✓ Final clean data: " . count($unique) . " rates\n\n";
 
 $allRates = $unique;
+
+// Sort by CARRIER to group all rates by shipping line
+usort($allRates, function($a, $b) {
+    return strcmp($a['CARRIER'], $b['CARRIER']);
+});
+
+echo "  → Sorted by CARRIER\n";
 
 // Step 4: Create final Excel file
 echo "Step 4: Creating final Excel file...\n";
