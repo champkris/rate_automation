@@ -187,11 +187,6 @@ foreach ($excelFiles as $excelFile) {
                 $dates = array_map('trim', $dates);
                 $dates = array_filter($dates); // Remove empty values
 
-                // Filter out SSW from dates array
-                $dates = array_filter($dates, function($date) {
-                    return stripos($date, 'SSW') === false;
-                });
-
                 if (count($dates) >= 2) {
                     // Multiple dates found
                     // Collect dates for BKK and LCH separately
@@ -202,9 +197,15 @@ foreach ($excelFiles as $excelFile) {
                     foreach ($dates as $date) {
                         $hasBkk = preg_match('/(PAT|BKK)/i', $date);
                         $hasLch = preg_match('/LCH/i', $date);
+                        $hasSSW = preg_match('/SSW/i', $date);
+
+                        // Skip if it's SSW only (no BKK/PAT or LCH indicator)
+                        if ($hasSSW && !$hasBkk && !$hasLch) {
+                            continue;
+                        }
 
                         if ($hasBkk && $hasLch) {
-                            // Date has both BKK and LCH indicators
+                            // Date has both BKK and LCH indicators (may also have SSW)
                             // Extract just the day name (e.g., "MON" from "MON (BKK PAT & LCH)")
                             if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
                                 $dayName = $matches[1];
@@ -215,14 +216,14 @@ foreach ($excelFiles as $excelFile) {
                                 $lchDates[] = $date;
                             }
                         } elseif ($hasBkk) {
-                            // Only BKK/PAT indicator
+                            // Only BKK/PAT indicator (may also have SSW)
                             if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
                                 $bkkDates[] = $matches[1];
                             } else {
                                 $bkkDates[] = $date;
                             }
                         } elseif ($hasLch) {
-                            // Only LCH indicator
+                            // Only LCH indicator (may also have SSW)
                             if (preg_match('/^([A-Z]{3})/i', $date, $matches)) {
                                 $lchDates[] = $matches[1];
                             } else {
@@ -242,17 +243,49 @@ foreach ($excelFiles as $excelFile) {
                     $etdBkk = !empty($bkkDates) ? implode('/', $bkkDates) : '';
                     $etdLch = !empty($lchDates) ? implode('/', $lchDates) : '';
                 } elseif (count($dates) === 1) {
-                    // Single date found - check POL to determine which ETD column
+                    // Single date found
                     $singleDate = $dates[0];
+                    $hasSSW = preg_match('/SSW/i', $singleDate);
 
-                    // Check if POL indicates LCH or BKK
-                    if (stripos($pol, 'LCH') !== false || stripos($pol, 'LAEM CHABANG') !== false) {
-                        $etdLch = $singleDate;
-                    } elseif (stripos($pol, 'BKK') !== false || stripos($pol, 'BANGKOK') !== false) {
-                        $etdBkk = $singleDate;
+                    // If it's SSW only, skip ETD processing
+                    if ($hasSSW && stripos($singleDate, 'LCH') === false && stripos($singleDate, 'BKK') === false && stripos($singleDate, 'PAT') === false) {
+                        // Just SSW, no ETD dates
                     } else {
-                        // Default to LCH if POL is ambiguous
-                        $etdLch = $singleDate;
+                        // Check if date has LCH or BKK indicators
+                        $hasLch = preg_match('/LCH/i', $singleDate);
+                        $hasBkk = preg_match('/(PAT|BKK)/i', $singleDate);
+
+                        if ($hasLch && $hasBkk) {
+                            // Has both - extract to both columns
+                            if (preg_match('/^([A-Z]{3})/i', $singleDate, $matches)) {
+                                $etdBkk = $matches[1];
+                                $etdLch = $matches[1];
+                            }
+                        } elseif ($hasLch) {
+                            // Has LCH only
+                            if (preg_match('/^([A-Z]{3})/i', $singleDate, $matches)) {
+                                $etdLch = $matches[1];
+                            } else {
+                                $etdLch = $singleDate;
+                            }
+                        } elseif ($hasBkk) {
+                            // Has BKK only
+                            if (preg_match('/^([A-Z]{3})/i', $singleDate, $matches)) {
+                                $etdBkk = $matches[1];
+                            } else {
+                                $etdBkk = $singleDate;
+                            }
+                        } else {
+                            // Check POL to determine which ETD column
+                            if (stripos($pol, 'LCH') !== false || stripos($pol, 'LAEM CHABANG') !== false) {
+                                $etdLch = $singleDate;
+                            } elseif (stripos($pol, 'BKK') !== false || stripos($pol, 'BANGKOK') !== false) {
+                                $etdBkk = $singleDate;
+                            } else {
+                                // Default to LCH if POL is ambiguous
+                                $etdLch = $singleDate;
+                            }
+                        }
                     }
                 }
             }
