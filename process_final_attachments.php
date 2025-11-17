@@ -112,6 +112,9 @@ foreach ($excelFiles as $excelFile) {
         // Header is at row 9: Country | Port of Discharge | POD code | POL | Service | ETD | 20'GP | 40'HC | T/S | T/T | FREE TIME | ...
         // Note: Columns D, F, G, H, I, J, K may have merged cells that need to be handled
 
+        // Extract VALIDITY from cell B6
+        $validity = trim($worksheet->getCell('B6')->getValue() ?? 'NOV 2025');
+
         // First, build a map of merged cell values
         $mergedCellValues = [];
         foreach ($worksheet->getMergeCells() as $mergeRange) {
@@ -312,7 +315,7 @@ foreach ($excelFiles as $excelFile) {
                 'T/T' => $tt,
                 'T/S' => $ts,
                 'FREE TIME' => $freeTime,
-                'VALIDITY' => 'NOV 2025',
+                'VALIDITY' => $validity,
                 'REMARK' => $remark,
                 'Export' => '',
                 'Who use?' => '',
