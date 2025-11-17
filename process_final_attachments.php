@@ -127,9 +127,9 @@ foreach ($excelFiles as $excelFile) {
                 '40RF' => '',
                 'ETD BKK' => '',
                 'ETD LCH' => '',
-                'T/T' => '',
-                'T/S' => '',
-                'FREE TIME' => '',
+                'T/T' => 'TBA',
+                'T/S' => 'TBA',
+                'FREE TIME' => 'TBA',
                 'VALIDITY' => 'NOV 2025',
                 'REMARK' => $country,
                 'Export' => '',
@@ -195,6 +195,16 @@ foreach ($excelFiles as $excelFile) {
             // Add "Days" suffix to T/T if not empty
             if (!empty($tt)) {
                 $tt .= ' Days';
+            } else {
+                $tt = 'TBA';
+            }
+
+            // Set TBA for empty T/S and Free Time
+            if (empty($ts)) {
+                $ts = 'TBA';
+            }
+            if (empty($freeTime)) {
+                $freeTime = 'TBA';
             }
 
             $rate20 = $getCellValue('G', $row);
@@ -688,9 +698,9 @@ function createRateEntry($carrier, $pod, $rate20, $rate40) {
         '40RF' => '',
         'ETD BKK' => '',
         'ETD LCH' => '',
-        'T/T' => '',
-        'T/S' => '',
-        'FREE TIME' => '',
+        'T/T' => 'TBA',
+        'T/S' => 'TBA',
+        'FREE TIME' => 'TBA',
         'VALIDITY' => 'NOV 2025',
         'REMARK' => '',
         'Export' => '',
@@ -714,9 +724,9 @@ function extractRateFromCells($cells, $carrier) {
         '40RF' => '',
         'ETD BKK' => '',
         'ETD LCH' => '',
-        'T/T' => '',
-        'T/S' => '',
-        'FREE TIME' => '',
+        'T/T' => 'TBA',
+        'T/S' => 'TBA',
+        'FREE TIME' => 'TBA',
         'VALIDITY' => '',
         'REMARK' => '',
         'Export' => '',
@@ -745,7 +755,7 @@ function extractRateFromCells($cells, $carrier) {
             $rate["40'"] = str_replace(',', '', $matches[1]);
         }
 
-        if (preg_match('/(\d+)\s*(day|Day)/i', $cell, $matches) && empty($rate['T/T'])) {
+        if (preg_match('/(\d+)\s*(day|Day)/i', $cell, $matches) && ($rate['T/T'] === 'TBA' || empty($rate['T/T']))) {
             $rate['T/T'] = $matches[0];
         }
 
