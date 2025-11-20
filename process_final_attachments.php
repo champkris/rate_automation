@@ -437,10 +437,13 @@ foreach ($pdfFiles as $pdfFile) {
 
     // Extract carrier name from filename
     $carrier = '';
+    $validity = ''; // Will be extracted from PDF content
     if (preg_match('/SINOKOR/i', $filename)) {
         $carrier = 'SINOKOR';
     } elseif (preg_match('/BOXMAN/i', $filename)) {
         $carrier = 'BOXMAN';
+        // Extract validity from Azure OCR JSON for BOXMAN
+        $validity = extractValidityFromJson($azureResultsDir . $baseFilename . '_azure_result.json');
     } elseif (preg_match('/INDIA/i', $filename)) {
         $carrier = 'WANHAI';
     } elseif (preg_match('/WANHAI/i', $filename)) {
@@ -463,7 +466,7 @@ foreach ($pdfFiles as $pdfFile) {
 
     // Read and parse table file
     $content = file_get_contents($tableFile);
-    $ratesFromFile = parseTableFile($content, $carrier, $filename);
+    $ratesFromFile = parseTableFile($content, $carrier, $filename, $validity);
 
     $allRates = array_merge($allRates, $ratesFromFile);
     $azureRatesAdded += count($ratesFromFile);
@@ -601,7 +604,7 @@ echo "  Output file:          FINAL_RATES_FROM_ATTACHMENTS.xlsx\n";
 echo str_repeat('=', 100) . "\n";
 
 // Helper function to parse table files
-function parseTableFile($content, $carrier, $filename) {
+function parseTableFile($content, $carrier, $filename, $validity = '') {
     $rates = [];
     $lines = explode("\n", $content);
 
@@ -611,7 +614,7 @@ function parseTableFile($content, $carrier, $filename) {
     } elseif ($carrier === 'HEUNG A') {
         return parseHeungATable($lines, $carrier);
     } elseif ($carrier === 'BOXMAN') {
-        return parseBoxmanTable($lines, $carrier);
+        return parseBoxmanTable($lines, $carrier, $validity);
     } elseif (preg_match('/INDIA/i', $filename)) {
         return parseIndiaRateTable($lines, $carrier);
     }
@@ -809,10 +812,15 @@ function parseHeungATable($lines, $carrier) {
 }
 
 // Parse BOXMAN specific table format
-function parseBoxmanTable($lines, $carrier) {
+function parseBoxmanTable($lines, $carrier, $validity = '') {
     $rates = [];
     $lastPol = ''; // Track last POL for merged cells
     $lastEtd = ''; // Track last ETD for merged cells
+
+    // Default validity if not provided
+    if (empty($validity)) {
+        $validity = 'NOV 2025';
+    }
 
     foreach ($lines as $line) {
         if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) {
@@ -953,7 +961,7 @@ function parseBoxmanTable($lines, $carrier) {
             'T/T' => $tt,
             'T/S' => $ts,
             'FREE TIME' => 'TBA',
-            'VALIDITY' => 'NOV 2025',
+            'VALIDITY' => $validity,
             'REMARK' => $remarks,
             'Export' => '',
             'Who use?' => '',
@@ -1090,4 +1098,42 @@ function extractRateFromCells($cells, $carrier) {
     }
 
     return $rate;
+}
+
+// Extract validity date from Azure OCR JSON file
+// Pattern: "valid until DD/MM/YYYY" → format as "DD Mon YYYY"
+function extractValidityFromJson($jsonFile) {
+    if (!file_exists($jsonFile)) {
+        return 'NOV 2025'; // Default fallback
+    }
+
+    $jsonContent = file_get_contents($jsonFile);
+    $data = json_decode($jsonContent, true);
+
+    if (!$data || !isset($data['analyzeResult']['content'])) {
+        return 'NOV 2025'; // Default fallback
+    }
+
+    $content = $data['analyzeResult']['content'];
+
+    // Search for pattern: "valid until DD/MM/YYYY" or "valid until DD\/MM\/YYYY"
+    if (preg_match('/valid\s+until\s+(\d{1,2})[\/\\\\](\d{1,2})[\/\\\\](\d{4})/i', $content, $matches)) {
+        $day = $matches[1];
+        $month = $matches[2];
+        $year = $matches[3];
+
+        // Convert month number to month name
+        $monthNames = [
+            '01' => 'Jan', '02' => 'Feb', '03' => 'Mar', '04' => 'Apr',
+            '05' => 'May', '06' => 'Jun', '07' => 'Jul', '08' => 'Aug',
+            '09' => 'Sep', '10' => 'Oct', '11' => 'Nov', '12' => 'Dec'
+        ];
+
+        $monthName = $monthNames[str_pad($month, 2, '0', STR_PAD_LEFT)] ?? 'Jan';
+
+        // Format: "14 Nov 2025"
+        return $day . ' ' . $monthName . ' ' . $year;
+    }
+
+    return 'NOV 2025'; // Default fallback if pattern not found
 }
