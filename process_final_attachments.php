@@ -195,9 +195,16 @@ foreach ($excelFiles as $excelFile) {
             // Check if this row has black highlighting
             $isBlackRow = false;
             $cellStyle = $worksheet->getCell('B' . $row)->getStyle();
-            $fillColor = $cellStyle->getFill()->getStartColor()->getRGB();
-            if ($fillColor === '000000' || strtoupper($fillColor) === '000000') {
-                $isBlackRow = true;
+            $fill = $cellStyle->getFill();
+            $fillType = $fill->getFillType();
+
+            // Only check color if there's actually a fill (not 'none')
+            if ($fillType !== \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_NONE) {
+                $fillColor = strtoupper($fill->getStartColor()->getRGB());
+                // Check for pure black (000000) or dark gray (333333)
+                if (in_array($fillColor, ['000000', '333333'])) {
+                    $isBlackRow = true;
+                }
             }
 
             // Add "Days" suffix to T/T if not empty
