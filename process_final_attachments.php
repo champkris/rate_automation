@@ -568,9 +568,11 @@ function parseTableFile($content, $carrier, $filename) {
     $rates = [];
     $lines = explode("\n", $content);
 
-    // Special handling for SINOKOR and INDIA RATE files
+    // Special handling for SINOKOR, HEUNG A, and INDIA RATE files
     if ($carrier === 'SINOKOR') {
         return parseSinokorTable($lines, $carrier);
+    } elseif ($carrier === 'HEUNG A') {
+        return parseHeungATable($lines, $carrier);
     } elseif (preg_match('/INDIA/i', $filename)) {
         return parseIndiaRateTable($lines, $carrier);
     }
@@ -638,6 +640,129 @@ function parseSinokorTable($lines, $carrier) {
 
         if (!empty($pod) && (!empty($rate20) || !empty($rate40))) {
             $rates[] = createRateEntry($carrier, $pod, $rate20, $rate40);
+        }
+    }
+
+    return $rates;
+}
+
+// Parse HEUNG A specific table format
+function parseHeungATable($lines, $carrier) {
+    $rates = [];
+
+    foreach ($lines as $line) {
+        if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) {
+            continue;
+        }
+
+        $rowData = $matches[1];
+        $cells = explode(' | ', $rowData);
+
+        // Skip header rows and rows with insufficient data
+        if (count($cells) < 4) continue;
+        if (preg_match('/(POL|POD|Nov2025|20\'|40\')/i', $cells[0] ?? '')) continue;
+        if (preg_match('/(20\'|40\',HQ)/i', $cells[0] ?? '')) continue;
+
+        // Format: POL | POD | 20' | 40' | Sailing/Week | Sailing date | Direct/TS | Transit Time | Surcharge
+        // BUT for "Check port" rows: POL | POD | Check port | Sailing/Week | Sailing date | Direct/TS | Transit Time
+        $pol = trim($cells[0] ?? '');
+        $pod = trim($cells[1] ?? '');
+        $rate20 = trim($cells[2] ?? '');
+        $rate40 = trim($cells[3] ?? '');
+
+        // Check if this is a "Check port" row (merged cell causes column shift)
+        $isCheckPort = (stripos($rate20, 'Check') !== false);
+
+        if ($isCheckPort) {
+            // Column shift: everything after "Check port" is shifted left by 1
+            $sailingDate = trim($cells[4] ?? '');   // Shifted from 5 to 4
+            $directTs = trim($cells[5] ?? '');      // Shifted from 6 to 5
+            $transitTime = trim($cells[6] ?? '');   // Shifted from 7 to 6
+            $surcharge = trim($cells[7] ?? '');     // Surcharge shifted to 7
+        } else {
+            // Normal column positions
+            $sailingDate = trim($cells[5] ?? '');   // Sailing date column
+            $directTs = trim($cells[6] ?? '');      // Direct/TS column
+            $transitTime = trim($cells[7] ?? '');   // Transit Time column
+            $surcharge = trim($cells[8] ?? '');     // Surcharge column
+        }
+
+        // Clean up POD (remove notes in parentheses like "(Light Cargos)" or "(Rice)")
+        $pod = preg_replace('/\s*\([^)]*\)/', '', $pod);
+        $pod = trim($pod);
+
+        // Clean up rate values based on whether this is a "Check port" row
+        if ($isCheckPort) {
+            // If this is a "Check port" row, set both rates to "Check port"
+            $rate20 = 'Check port';
+            $rate40 = 'Check port';
+        } else {
+            // Clean up rate values - keep only numbers
+            $rate20 = preg_replace('/[^0-9]/', '', $rate20);
+            $rate40 = preg_replace('/[^0-9]/', '', $rate40);
+        }
+
+        if (!empty($pod) && (!empty($rate20) || !empty($rate40))) {
+            // Determine ETD BKK and ETD LCH based on POL
+            $etdBkk = '';
+            $etdLch = '';
+
+            if (!empty($sailingDate)) {
+                // Check if POL contains both BKK and LCH
+                if (stripos($pol, 'BKK') !== false && stripos($pol, 'LCH') !== false) {
+                    // Contains both - populate both columns
+                    $etdBkk = $sailingDate;
+                    $etdLch = $sailingDate;
+                } elseif (stripos($pol, 'BKK') !== false) {
+                    // Contains only BKK
+                    $etdBkk = $sailingDate;
+                } elseif (stripos($pol, 'LCH') !== false || stripos($pol, 'Latkabang') !== false ||
+                          stripos($pol, 'TICT') !== false || stripos($pol, 'LKR') !== false) {
+                    // Contains LCH or variants (Latkabang, TICT, LKR)
+                    $etdLch = $sailingDate;
+                } else {
+                    // Default to both if unclear
+                    $etdBkk = $sailingDate;
+                    $etdLch = $sailingDate;
+                }
+            }
+
+            // Format Transit Time with "Days" suffix
+            $tt = '';
+            if (!empty($transitTime)) {
+                // Add "Days" suffix if not empty
+                $tt = $transitTime . ' Days';
+            } else {
+                $tt = 'TBA';
+            }
+
+            // Use Direct/TS value, default to TBA if empty
+            $ts = !empty($directTs) ? $directTs : 'TBA';
+
+            // Create rate entry with actual POL value (not hardcoded)
+            $rates[] = [
+                'CARRIER' => $carrier,
+                'POL' => $pol,  // Use actual POL from source data
+                'POD' => $pod,
+                'CUR' => 'USD',
+                "20'" => $rate20,
+                "40'" => $rate40,
+                '40 HQ' => $rate40,
+                '20 TC' => '',
+                '20 RF' => '',
+                '40RF' => '',
+                'ETD BKK' => $etdBkk,
+                'ETD LCH' => $etdLch,
+                'T/T' => $tt,
+                'T/S' => $ts,
+                'FREE TIME' => 'TBA',
+                'VALIDITY' => 'NOV 2025',
+                'REMARK' => $surcharge,  // Use surcharge value
+                'Export' => '',
+                'Who use?' => '',
+                'Rate Adjust' => '',
+                '1.1' => ''
+            ];
         }
     }
 
