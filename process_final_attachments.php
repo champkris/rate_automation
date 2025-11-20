@@ -605,11 +605,13 @@ function parseTableFile($content, $carrier, $filename) {
     $rates = [];
     $lines = explode("\n", $content);
 
-    // Special handling for SINOKOR, HEUNG A, and INDIA RATE files
+    // Special handling for SINOKOR, HEUNG A, BOXMAN, and INDIA RATE files
     if ($carrier === 'SINOKOR') {
         return parseSinokorTable($lines, $carrier);
     } elseif ($carrier === 'HEUNG A') {
         return parseHeungATable($lines, $carrier);
+    } elseif ($carrier === 'BOXMAN') {
+        return parseBoxmanTable($lines, $carrier);
     } elseif (preg_match('/INDIA/i', $filename)) {
         return parseIndiaRateTable($lines, $carrier);
     }
@@ -801,6 +803,163 @@ function parseHeungATable($lines, $carrier) {
                 '1.1' => ''
             ];
         }
+    }
+
+    return $rates;
+}
+
+// Parse BOXMAN specific table format
+function parseBoxmanTable($lines, $carrier) {
+    $rates = [];
+    $lastPol = ''; // Track last POL for merged cells
+    $lastEtd = ''; // Track last ETD for merged cells
+
+    foreach ($lines as $line) {
+        if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) {
+            continue;
+        }
+
+        $rowData = $matches[1];
+        $cells = explode(' | ', $rowData);
+
+        // Skip header rows and reset lastEtd for new tables
+        if (count($cells) < 3) continue;
+        if (preg_match('/(Port of Loading|POL|20\'DC|40\'HC)/i', $cells[0] ?? '')) {
+            $lastEtd = ''; // Reset lastEtd when encountering a new table header
+            continue;
+        }
+
+        // BOXMAN format: POL | POD | 20' | 40' | ETD | Transit Time | Remarks
+        // Column positions:
+        // 0: POL (Port of Loading) - can be "LKB", "LCH", "LKB LCH", etc.
+        // 1: POD (Port of Discharge)
+        // 2: 20' rate (with "USD" prefix)
+        // 3: 40' rate (with "USD" prefix)
+        // 4: ETD (sailing day like "WED", "SAT")
+        // 5: Transit Time (like "3 days", "11 days")
+        // 6: Remarks (optional)
+
+        $pol = trim($cells[0] ?? '');
+        $pod = trim($cells[1] ?? '');
+        $rate20 = trim($cells[2] ?? '');
+        $rate40 = trim($cells[3] ?? '');
+        $etd = trim($cells[4] ?? '');
+        $transitTime = trim($cells[5] ?? '');
+        $remarks = trim($cells[6] ?? '');
+
+        // Handle merged POL cells - if POL is empty or looks like a POD, use last POL
+        if (empty($pol) || preg_match('/^[A-Z][a-z]/', $pol)) {
+            // If POL looks like a destination name, shift columns left
+            if (preg_match('/^[A-Z][a-z]/', $pol) && !preg_match('/(LKB|LCH|BKK)/i', $pol)) {
+                // POL is actually POD, shift everything
+                $remarks = $transitTime;
+                $transitTime = $etd;
+                $etd = $rate40;
+                $rate40 = $rate20;
+                $rate20 = $pod;
+                $pod = $pol;
+                $pol = $lastPol;
+            } else {
+                $pol = $lastPol;
+            }
+        } else {
+            $lastPol = $pol;
+        }
+
+        // Clean up rate values (remove "USD", commas, etc.)
+        $rate20 = preg_replace('/[^0-9]/', '', $rate20);
+        $rate40 = preg_replace('/[^0-9]/', '', $rate40);
+
+        // Skip if no valid POD or rates
+        if (empty($pod) || (empty($rate20) && empty($rate40))) {
+            continue;
+        }
+
+        // First, filter out invalid ETD values (like transit time containing "days")
+        // If ETD contains "days", it's likely the transit time shifted into ETD column
+        if (!empty($etd) && stripos($etd, 'day') !== false) {
+            // If transit time is empty, use this value as transit time
+            if (empty($transitTime)) {
+                $transitTime = $etd;
+            }
+            $etd = ''; // Clear invalid ETD that looks like transit time
+        }
+
+        // Handle merged ETD cells - if ETD is empty, use last ETD
+        if (empty($etd) && !empty($lastEtd)) {
+            $etd = $lastEtd;
+        }
+
+        // Update lastEtd if we have a valid ETD
+        if (!empty($etd)) {
+            $lastEtd = $etd;
+        }
+
+        // Map POL to ETD columns
+        $etdBkk = '';
+        $etdLch = '';
+
+        if (!empty($pol) && !empty($etd)) {
+            // LKB (Lat Krabang) → ETD LCH
+            // LCH (Laem Chabang) → ETD LCH
+            // BKK (Bangkok) → ETD BKK
+            // "LKB LCH" or combinations → both columns
+
+            $polUpper = strtoupper($pol);
+
+            if (strpos($polUpper, 'LKB') !== false && strpos($polUpper, 'LCH') !== false) {
+                // Contains both LKB and LCH → populate both columns
+                $etdBkk = $etd;
+                $etdLch = $etd;
+            } elseif (strpos($polUpper, 'LKB') !== false || strpos($polUpper, 'LCH') !== false || strpos($polUpper, 'LKE') !== false) {
+                // Contains LKB, LCH, or LKE → ETD LCH
+                $etdLch = $etd;
+            } elseif (strpos($polUpper, 'BKK') !== false) {
+                // Contains BKK → ETD BKK
+                $etdBkk = $etd;
+            } else {
+                // Default to ETD LCH if unclear
+                $etdLch = $etd;
+            }
+        }
+
+        // Format Transit Time
+        $tt = !empty($transitTime) ? $transitTime : 'TBA';
+
+        // Determine T/S from remarks
+        $ts = 'TBA';
+        if (!empty($remarks)) {
+            if (stripos($remarks, 'DIRECT') !== false) {
+                $ts = 'DIRECT';
+            } elseif (preg_match('/T\/S\s+(.+)/i', $remarks, $tsMatch)) {
+                $ts = 'T/S ' . trim($tsMatch[1]);
+            }
+        }
+
+        // Create rate entry
+        $rates[] = [
+            'CARRIER' => $carrier,
+            'POL' => $pol,
+            'POD' => $pod,
+            'CUR' => 'USD',
+            "20'" => $rate20,
+            "40'" => $rate40,
+            '40 HQ' => $rate40,
+            '20 TC' => '',
+            '20 RF' => '',
+            '40RF' => '',
+            'ETD BKK' => $etdBkk,
+            'ETD LCH' => $etdLch,
+            'T/T' => $tt,
+            'T/S' => $ts,
+            'FREE TIME' => 'TBA',
+            'VALIDITY' => 'NOV 2025',
+            'REMARK' => $remarks,
+            'Export' => '',
+            'Who use?' => '',
+            'Rate Adjust' => '',
+            '1.1' => ''
+        ];
     }
 
     return $rates;
