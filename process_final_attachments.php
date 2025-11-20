@@ -192,6 +192,14 @@ foreach ($excelFiles as $excelFile) {
             $freeTime = trim($getCellValue('K', $row) ?? '');  // FREE TIME from column K
             $remarkColumnL = trim($getCellValue('L', $row) ?? '');  // REMARK from column L
 
+            // Check if this row has black highlighting
+            $isBlackRow = false;
+            $cellStyle = $worksheet->getCell('B' . $row)->getStyle();
+            $fillColor = $cellStyle->getFill()->getStartColor()->getRGB();
+            if ($fillColor === '000000' || strtoupper($fillColor) === '000000') {
+                $isBlackRow = true;
+            }
+
             // Add "Days" suffix to T/T if not empty
             if (!empty($tt)) {
                 $tt .= ' Days';
@@ -348,6 +356,17 @@ foreach ($excelFiles as $excelFile) {
             }
 
             // Create rate entry
+            // If this is a black highlighted row, replace all rate values with TBA
+            if ($isBlackRow) {
+                $rate20 = 'TBA';
+                $rate40 = 'TBA';
+                $etdBkk = 'TBA';
+                $etdLch = 'TBA';
+                $tt = 'TBA';
+                $ts = 'TBA';
+                $freeTime = 'TBA';
+            }
+
             $rate = [
                 'CARRIER' => $carrier,
                 'POL' => $pol ?: 'BKK/LCH',
@@ -369,7 +388,8 @@ foreach ($excelFiles as $excelFile) {
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
-                '1.1' => ''
+                '1.1' => '',
+                '_isBlackRow' => $isBlackRow  // Flag for output formatting
             ];
 
             $allRates[] = $rate;
@@ -520,6 +540,16 @@ foreach ($allRates as $rate) {
         $value = $rate[$header] ?? '';
         $sheet->setCellValue($col . $rowNum, $value);
     }
+
+    // Apply black highlighting if this row was marked as black in source
+    if (isset($rate['_isBlackRow']) && $rate['_isBlackRow'] === true) {
+        $sheet->getStyle('A' . $rowNum . ':U' . $rowNum)->getFill()
+            ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+            ->getStartColor()->setARGB('FF000000');
+        $sheet->getStyle('A' . $rowNum . ':U' . $rowNum)->getFont()
+            ->getColor()->setARGB('FFFFFFFF');  // White text on black background
+    }
+
     $rowNum++;
 }
 
