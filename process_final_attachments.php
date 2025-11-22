@@ -13,7 +13,7 @@ set_time_limit(600);
 function formatValidity($validityRaw) {
     // Default return if invalid
     if (empty($validityRaw)) {
-        return 'NOV 2025';
+        return 'DEC 2025';
     }
 
     // Month names
@@ -99,18 +99,24 @@ foreach ($excelFiles as $excelFile) {
     $ratesAdded = 0;
 
     if ($carrier === 'KMTC') {
-        // KMTC format: starts at row 6, columns B-F
-        // B=Country/POD, C=POL, D=POD Area, E=20'GP, F=40'HC
+        // KMTC format: starts at row 6
+        // B=Country/POD, C=POL, D=POD Area, E=20'GP, F=40'HC, J=Freetime (DEM/DET)
         for ($row = 6; $row <= $highestRow; $row++) {
             $country = trim($worksheet->getCell('B' . $row)->getValue() ?? '');
             $pol = trim($worksheet->getCell('C' . $row)->getValue() ?? '');
             $podArea = trim($worksheet->getCell('D' . $row)->getValue() ?? '');
             $rate20 = trim($worksheet->getCell('E' . $row)->getValue() ?? '');
             $rate40 = trim($worksheet->getCell('F' . $row)->getValue() ?? '');
+            $freeTime = trim($worksheet->getCell('J' . $row)->getValue() ?? '');
 
             // Skip empty rows
             if (empty($podArea) && empty($rate20) && empty($rate40)) {
                 continue;
+            }
+
+            // Default free time if empty
+            if (empty($freeTime)) {
+                $freeTime = 'TBA';
             }
 
             // Create rate entry
@@ -129,8 +135,8 @@ foreach ($excelFiles as $excelFile) {
                 'ETD LCH' => '',
                 'T/T' => 'TBA',
                 'T/S' => 'TBA',
-                'FREE TIME' => 'TBA',
-                'VALIDITY' => 'NOV 2025',
+                'FREE TIME' => $freeTime,
+                'VALIDITY' => 'DEC 2025',
                 'REMARK' => $country,
                 'Export' => '',
                 'Who use?' => '',
@@ -149,7 +155,7 @@ foreach ($excelFiles as $excelFile) {
         // Note: Columns D, F, G, H, I, J, K may have merged cells that need to be handled
 
         // Extract VALIDITY from cell B6
-        $validityRaw = trim($worksheet->getCell('B6')->getValue() ?? 'NOV 2025');
+        $validityRaw = trim($worksheet->getCell('B6')->getValue() ?? 'DEC 2025');
 
         // Convert validity to readable format (e.g., "01/11-15/11" -> "15 Nov 2025")
         $validity = formatValidity($validityRaw);
@@ -450,7 +456,7 @@ foreach ($pdfFiles as $pdfFile) {
         $carrier = 'WANHAI';
     } elseif (preg_match('/CK LINE/i', $filename)) {
         $carrier = 'CK LINE';
-    } elseif (preg_match('/HEUNG A/i', $filename)) {
+    } elseif (preg_match('/HEUNG A|HUANG-A|HUANG A/i', $filename)) {
         $carrier = 'HEUNG A';
     } elseif (preg_match('/SM LINE/i', $filename)) {
         $carrier = 'SM LINE';
@@ -608,13 +614,15 @@ function parseTableFile($content, $carrier, $filename, $validity = '') {
     $rates = [];
     $lines = explode("\n", $content);
 
-    // Special handling for SINOKOR, HEUNG A, BOXMAN, and INDIA RATE files
+    // Special handling for SINOKOR, HEUNG A, BOXMAN, SITC, and INDIA RATE files
     if ($carrier === 'SINOKOR') {
         return parseSinokorTable($lines, $carrier);
     } elseif ($carrier === 'HEUNG A') {
         return parseHeungATable($lines, $carrier);
     } elseif ($carrier === 'BOXMAN') {
         return parseBoxmanTable($lines, $carrier, $validity);
+    } elseif ($carrier === 'SITC') {
+        return parseSitcTable($lines, $carrier);
     } elseif (preg_match('/INDIA/i', $filename)) {
         return parseIndiaRateTable($lines, $carrier);
     }
@@ -798,7 +806,7 @@ function parseHeungATable($lines, $carrier) {
                 'T/T' => $tt,
                 'T/S' => $ts,
                 'FREE TIME' => 'TBA',
-                'VALIDITY' => 'NOV 2025',
+                'VALIDITY' => 'DEC 2025',
                 'REMARK' => $surcharge,  // Use surcharge value
                 'Export' => '',
                 'Who use?' => '',
@@ -819,7 +827,7 @@ function parseBoxmanTable($lines, $carrier, $validity = '') {
 
     // Default validity if not provided
     if (empty($validity)) {
-        $validity = 'NOV 2025';
+        $validity = 'DEC 2025';
     }
 
     foreach ($lines as $line) {
@@ -1012,6 +1020,306 @@ function parseIndiaRateTable($lines, $carrier) {
     return $rates;
 }
 
+// Parse SITC specific table format
+function parseSitcTable($lines, $carrier) {
+    $rates = [];
+    $currentTable = 0;
+    $table1Data = []; // Store TABLE 1 data
+    $table2Data = []; // Store TABLE 2 data (T/T, Transit type, Free time)
+
+    $lastPod = '';
+    $lastServiceRoute = '';
+    $lastFreeTime = 'TBA'; // Track last free time for merged cells
+
+    // First pass: Organize data by table
+    foreach ($lines as $line) {
+        // Detect table boundaries
+        if (preg_match('/^TABLE (\d+)/', $line, $tableMatch)) {
+            $currentTable = intval($tableMatch[1]);
+            continue;
+        }
+
+        if (!preg_match('/^Row (\d+): (.+)$/', $line, $matches)) {
+            continue;
+        }
+
+        $rowNum = intval($matches[1]);
+        $rowData = $matches[2];
+        $cells = explode(' | ', $rowData);
+
+        // Store data by table
+        if ($currentTable == 1) {
+            $table1Data[$rowNum] = $cells;
+        } elseif ($currentTable == 2) {
+            $table2Data[$rowNum] = $cells;
+        } elseif ($currentTable >= 3) {
+            // TABLE 3+ has combined format
+            // Use unique keys to avoid conflicts with TABLE 1
+            $uniqueKey = 'T' . $currentTable . '_R' . $rowNum;
+            $table1Data[$uniqueKey] = $cells;
+        }
+    }
+
+    // Second pass: Process TABLE 1 data with TABLE 2 metadata
+    foreach ($table1Data as $rowKey => $cells) {
+        // Extract numeric row number if this is from TABLE 3+
+        $numericRowNum = is_numeric($rowKey) ? intval($rowKey) : null;
+
+        // Skip header rows
+        if (preg_match('/(POL|POD|Service Route|FREIGHT RATE|Laem Chabang.*Ningbo)/i', $cells[0] ?? '')) {
+            if ($rowKey == 0 || $numericRowNum == 0) continue;
+        }
+        if (preg_match('/(20\'GP|40\',40\'HC|20RF|40HR)/i', $cells[0] ?? '')) continue;
+
+        $pol = trim($cells[0] ?? '');
+        if (empty($pol)) continue;
+
+        // Skip section headers (merged rows spanning all columns)
+        if (stripos($pol, 'China T/S') !== false || stripos($pol, 'T/S at') !== false) {
+            continue;
+        }
+
+        // Also check if col1 contains section header text
+        $col1Check = trim($cells[1] ?? '');
+        if (stripos($col1Check, 'China T/S') !== false || stripos($col1Check, 'T/S at') !== false) {
+            continue;
+        }
+
+        $rate20 = '';
+        $rate40 = '';
+        $pod = '';
+        $serviceRoute = '';
+        $tt = 'TBA';
+        $ts = 'TBA';
+        $freeTime = 'TBA';
+
+        $col1 = trim($cells[1] ?? '');
+
+        // Helper to detect if a value is a service route (e.g., VTX1, CKV2, JTH)
+        $isServiceRoute = function($value) {
+            return preg_match('/^(VTX|CKV|JTH|SSW)/i', $value);
+        };
+
+        // Check if this row has combined format (TABLE 3+) with more columns
+        if (count($cells) >= 9 && is_numeric(str_replace(',', '', $cells[3] ?? ''))) {
+            // Combined format: POL | POD | Service Route | 20' | 40' | ... | T/T | Transit type | Free time
+            $pod = $col1;
+            $serviceRoute = trim($cells[2] ?? '');
+            $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
+            $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+
+            // Extract T/T, Transit type, Free time from later columns
+            // Usually: col 7 = T/T, col 8 = Transit type, col 9 = Free time (if exists)
+            $tt = trim($cells[7] ?? 'TBA');
+            $ts = trim($cells[8] ?? 'TBA');
+            $freeTime = trim($cells[9] ?? '');
+
+            // If free time is empty, use last free time (merged cell)
+            if (empty($freeTime) || $freeTime === 'TBA') {
+                $freeTime = $lastFreeTime;
+            } else {
+                $lastFreeTime = $freeTime; // Update last free time
+            }
+
+            if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day')) {
+                $tt .= ' Days';
+            }
+
+            $lastPod = $pod;
+            $lastServiceRoute = $serviceRoute;
+        } elseif (is_numeric(str_replace(',', '', $col1)) || empty($col1) || $isServiceRoute($col1)) {
+            // Pattern 2: Continuation rows with merged POD (and possibly merged Service Route)
+            // Type A: POL | 20' | 40' | Surcharge | T/T | Transit type (POD+ServiceRoute merged, rates in col 1&2)
+            // Type B: POL | 20' | 40' | ... (POD merged only, rates in col 0&1)
+            // Type C: POL | Service Route | ... | 20' | 40' | ... (POD merged, service route in col 1)
+            $pod = $lastPod;
+
+            // Check if this is Type A: col1 is numeric AND col2 is numeric AND col3 is NOT numeric
+            $col2 = trim($cells[2] ?? '');
+            $col3 = trim($cells[3] ?? '');
+            $isTypeA = is_numeric(str_replace(',', '', $col1)) &&
+                       is_numeric(str_replace(',', '', $col2)) &&
+                       !empty($col3) &&
+                       !is_numeric(str_replace(',', '', $col3));
+
+            if ($isTypeA) {
+                // Type A: POL | 20' | 40' | Surcharge | T/T | Transit type
+                $serviceRoute = $lastServiceRoute;
+                $rate20 = str_replace(',', '', $col1);
+                $rate40 = str_replace(',', '', $col2);
+
+                // Extract T/T and Transit type from columns 4 & 5
+                $tt = trim($cells[4] ?? 'TBA');
+                $ts = trim($cells[5] ?? 'TBA');
+                $freeTime = trim($cells[6] ?? '');
+
+                // If free time is empty, use last free time (merged cell)
+                if (empty($freeTime) || $freeTime === 'TBA') {
+                    $freeTime = $lastFreeTime;
+                } else {
+                    $lastFreeTime = $freeTime;
+                }
+
+                if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day')) {
+                    $tt .= ' Days';
+                }
+            } elseif ($isServiceRoute($col1)) {
+                // Service route in col1, rates are shifted: POL | Service Route | ... | 20' | 40' | T/T | Transit type
+                $serviceRoute = $col1;
+                $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
+                $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+
+                // Clean up 40' rate - remove non-numeric text like "case (Reefer)"
+                if (!is_numeric(str_replace(',', '', $rate40))) {
+                    $rate40 = ''; // Invalid rate
+                }
+
+                // Extract T/T and Transit type from later columns (TABLE 3+ format)
+                $tt = trim($cells[5] ?? 'TBA');
+                $ts = trim($cells[6] ?? 'TBA');
+                $freeTime = trim($cells[7] ?? '');
+
+                // If free time is empty, use last free time (merged cell)
+                if (empty($freeTime) || $freeTime === 'TBA') {
+                    $freeTime = $lastFreeTime;
+                } else {
+                    $lastFreeTime = $freeTime;
+                }
+
+                if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day')) {
+                    $tt .= ' Days';
+                }
+            } else {
+                // Normal continuation: POL | 20' | 40'
+                $serviceRoute = $lastServiceRoute;
+                $rate20 = str_replace(',', '', $col1);
+                $rate40 = str_replace(',', '', trim($cells[2] ?? ''));
+
+                // Get T/T, Transit type, Free time from TABLE 2 if available
+                if ($numericRowNum !== null && isset($table2Data[$numericRowNum])) {
+                $table2Cells = $table2Data[$numericRowNum];
+
+                // Check if this is a continuation row (POD merged)
+                // Continuation row: col[0] is T/T (numeric), col[1] is Transit type
+                // Full row: col[0] is Surcharge, col[1] is T/T, col[2] is Transit type, col[3] is Free time
+                $firstCol = trim($table2Cells[0] ?? '');
+                $isContinuation = is_numeric(str_replace('-', '', $firstCol)) ||
+                                  preg_match('/^\d+(-\d+)?$/', $firstCol) ||
+                                  empty($firstCol);
+
+                if ($isContinuation) {
+                    // Continuation row: columns are shifted
+                    $tt = trim($table2Cells[0] ?? 'TBA');
+                    $ts = trim($table2Cells[1] ?? 'TBA');
+                    $freeTime = trim($table2Cells[2] ?? '');
+                } else {
+                    // Full row: normal column positions
+                    $tt = trim($table2Cells[1] ?? 'TBA');
+                    $ts = trim($table2Cells[2] ?? 'TBA');
+                    $freeTime = trim($table2Cells[3] ?? '');
+                }
+
+                // If free time is empty, use last free time (merged cell)
+                if (empty($freeTime) || $freeTime === 'TBA') {
+                    $freeTime = $lastFreeTime;
+                } else {
+                    $lastFreeTime = $freeTime; // Update last free time
+                }
+
+                if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day')) {
+                    $tt .= ' Days';
+                }
+                }
+            }
+        } else {
+            // Pattern 1: POL | POD | Service Route | 20' | 40' | ...
+            $pod = $col1;
+            $serviceRoute = trim($cells[2] ?? '');
+            $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
+            $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+
+            // Get T/T, Transit type, Free time from TABLE 2 if available
+            if ($numericRowNum !== null && isset($table2Data[$numericRowNum])) {
+                $table2Cells = $table2Data[$numericRowNum];
+
+                // Check if this is a continuation row (POD merged)
+                // Continuation row: col[0] is T/T (numeric), col[1] is Transit type
+                // Full row: col[0] is Surcharge, col[1] is T/T, col[2] is Transit type, col[3] is Free time
+                $firstCol = trim($table2Cells[0] ?? '');
+                $isContinuation = is_numeric(str_replace('-', '', $firstCol)) ||
+                                  preg_match('/^\d+(-\d+)?$/', $firstCol) ||
+                                  empty($firstCol);
+
+                if ($isContinuation) {
+                    // Continuation row: columns are shifted
+                    $tt = trim($table2Cells[0] ?? 'TBA');
+                    $ts = trim($table2Cells[1] ?? 'TBA');
+                    $freeTime = trim($table2Cells[2] ?? '');
+                } else {
+                    // Full row: normal column positions
+                    $tt = trim($table2Cells[1] ?? 'TBA');
+                    $ts = trim($table2Cells[2] ?? 'TBA');
+                    $freeTime = trim($table2Cells[3] ?? '');
+                }
+
+                // If free time is empty, use last free time (merged cell)
+                if (empty($freeTime) || $freeTime === 'TBA') {
+                    $freeTime = $lastFreeTime;
+                } else {
+                    $lastFreeTime = $freeTime; // Update last free time
+                }
+
+                if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day')) {
+                    $tt .= ' Days';
+                }
+            }
+
+            $lastPod = $pod;
+            $lastServiceRoute = $serviceRoute;
+        }
+
+        // Skip if no valid data
+        if (empty($pol) || empty($pod) || (empty($rate20) && empty($rate40))) {
+            continue;
+        }
+
+        // Skip header-like values
+        if (stripos($pol, 'Dem /Det') !== false || stripos($pol, 'Other surcharge') !== false) {
+            continue;
+        }
+
+        // Keep POD with all text including brackets/parentheses
+        $pod = trim($pod);
+
+        // Create rate entry
+        $rates[] = [
+            'CARRIER' => $carrier,
+            'POL' => $pol,
+            'POD' => $pod,
+            'CUR' => 'USD',
+            "20'" => $rate20,
+            "40'" => $rate40,
+            '40 HQ' => $rate40,
+            '20 TC' => '',
+            '20 RF' => '',
+            '40RF' => '',
+            'ETD BKK' => '',
+            'ETD LCH' => '',
+            'T/T' => $tt,
+            'T/S' => $ts,
+            'FREE TIME' => $freeTime,
+            'VALIDITY' => 'DEC 2025',
+            'REMARK' => $serviceRoute,
+            'Export' => '',
+            'Who use?' => '',
+            'Rate Adjust' => '',
+            '1.1' => ''
+        ];
+    }
+
+    return $rates;
+}
+
 // Helper to create standardized rate entry
 function createRateEntry($carrier, $pod, $rate20, $rate40) {
     return [
@@ -1104,14 +1412,14 @@ function extractRateFromCells($cells, $carrier) {
 // Pattern: "valid until DD/MM/YYYY" → format as "DD Mon YYYY"
 function extractValidityFromJson($jsonFile) {
     if (!file_exists($jsonFile)) {
-        return 'NOV 2025'; // Default fallback
+        return 'DEC 2025'; // Default fallback
     }
 
     $jsonContent = file_get_contents($jsonFile);
     $data = json_decode($jsonContent, true);
 
     if (!$data || !isset($data['analyzeResult']['content'])) {
-        return 'NOV 2025'; // Default fallback
+        return 'DEC 2025'; // Default fallback
     }
 
     $content = $data['analyzeResult']['content'];
@@ -1135,5 +1443,5 @@ function extractValidityFromJson($jsonFile) {
         return $day . ' ' . $monthName . ' ' . $year;
     }
 
-    return 'NOV 2025'; // Default fallback if pattern not found
+    return 'DEC 2025'; // Default fallback if pattern not found
 }

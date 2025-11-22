@@ -187,7 +187,7 @@ echo "  API Key: " . substr($apiKey, 0, 8) . "..." . substr($apiKey, -4) . "\n";
 echo "  Model: $model\n\n";
 
 // Get all PDF files (both .pdf and .PDF)
-$pdfDir = '/Users/apichakriskalambasuta/Sites/localhost/rate_automation/temp_attachments/';
+$pdfDir = '/Users/apichakriskalambasuta/Sites/localhost/rate_automation/docs/attachments/';
 $pdfFiles = array_merge(
     glob($pdfDir . '*.pdf'),
     glob($pdfDir . '*.PDF')
