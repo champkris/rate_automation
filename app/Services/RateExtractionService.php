@@ -160,6 +160,7 @@ class RateExtractionService
             'boxman' => $this->parseBoxmanTable($lines, $validity),
             'sitc' => $this->parseSitcTable($lines, $validity),
             'wanhai' => $this->parseWanhaiTable($lines, $validity),
+            'ts_line' => $this->parseTsLineTable($lines, $validity),
             default => $this->parseGenericTable($lines, $pattern, $validity),
         };
     }
@@ -1062,6 +1063,185 @@ class RateExtractionService
     }
 
     /**
+     * Parse TS LINE table format (from Azure OCR)
+     * Structure: COUNTRY | POD | DIRECT/T/S | T/T | BKK 20GP | BKK 40GP | LCB 20GP | LCB 40GP | DLSS | REMARK
+     */
+    protected function parseTsLineTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $currentCountry = '';
+
+        // Extract validity from title if not provided
+        if (empty($validity)) {
+            foreach ($lines as $line) {
+                // Pattern: "1 - 15 Nov. 25" or "1-15 Nov 25" or "OF 1 - 15 Nov. 25"
+                if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*[\'`]?(\d{2,4})/i', $line, $matches)) {
+                    $startDay = $matches[1];
+                    $endDay = $matches[2];
+                    $month = strtoupper(substr($matches[3], 0, 3));
+                    $year = $matches[4];
+                    if (strlen($year) == 2) {
+                        $year = '20' . $year;
+                    }
+                    $validity = "{$startDay}-{$endDay} {$month} {$year}";
+                    break;
+                }
+            }
+            // Fallback to current month if not found
+            if (empty($validity)) {
+                $validity = strtoupper(date('M Y'));
+            }
+        }
+
+        // First pass: merge continuation lines with their parent rows
+        $mergedLines = [];
+        $currentRowLine = '';
+        foreach ($lines as $line) {
+            if (preg_match('/^Row \d+:/', $line)) {
+                // Save previous row if exists
+                if (!empty($currentRowLine)) {
+                    $mergedLines[] = $currentRowLine;
+                }
+                $currentRowLine = $line;
+            } elseif (preg_match('/^:selected:/', $line) || preg_match('/^\s*\|/', $line)) {
+                // This is a continuation line - merge with current row
+                // Remove :selected: prefix and merge
+                $continuation = preg_replace('/^:selected:\s*/', '', $line);
+                $continuation = trim($continuation);
+                if (!empty($continuation)) {
+                    $currentRowLine .= ' | ' . $continuation;
+                }
+            } else {
+                // Other lines (table headers, etc.)
+                if (!empty($currentRowLine)) {
+                    $mergedLines[] = $currentRowLine;
+                    $currentRowLine = '';
+                }
+                $mergedLines[] = $line;
+            }
+        }
+        if (!empty($currentRowLine)) {
+            $mergedLines[] = $currentRowLine;
+        }
+
+        foreach ($mergedLines as $line) {
+            if (!preg_match('/^Row (\d+): (.+)$/', $line, $matches)) continue;
+
+            $rowNum = intval($matches[1]);
+            $rowContent = $matches[2];
+
+            // Clean up any remaining :selected: artifacts from OCR
+            $rowContent = preg_replace('/:selected:\s*\|?/', '', $rowContent);
+            $rowContent = trim($rowContent);
+            // Clean up duplicate pipes from merging
+            $rowContent = preg_replace('/\|\s*\|/', '|', $rowContent);
+
+            $cells = explode(' | ', $rowContent);
+
+            // Skip header rows and table headers
+            if ($rowNum <= 2) continue;
+            if (preg_match('/(COUNTRY|POD|DIRECT|T\/T|20\s*GP|BKK|LCB|OCEAN FREIGHT)/i', $cells[0] ?? '')) continue;
+
+            // Handle row structure based on number of columns
+            $country = '';
+            $pod = '';
+            $directTs = '';
+            $tt = '';
+            $bkkRate20 = '';
+            $bkkRate40 = '';
+            $lcbRate20 = '';
+            $lcbRate40 = '';
+            $remark = '';
+
+            // Determine if first cell is country or POD
+            $firstCell = trim($cells[0] ?? '');
+
+            // Country names are typically all caps, single word or with space
+            $isCountry = preg_match('/^(JAPAN|KOREA|TAIWAN|HONG KONG|CHINA|PHILIPPINES|VIETNAM|MIDDLE EAST|INDIA|Eest INDIA)$/i', $firstCell);
+
+            if ($isCountry && count($cells) >= 8) {
+                // Full row with country: COUNTRY | POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
+                $country = $firstCell;
+                $pod = trim($cells[1] ?? '');
+                $directTs = trim($cells[2] ?? '');
+                $tt = trim($cells[3] ?? '');
+                $bkkRate20 = trim($cells[4] ?? '');
+                $bkkRate40 = trim($cells[5] ?? '');
+                $lcbRate20 = trim($cells[6] ?? '');
+                $lcbRate40 = trim($cells[7] ?? '');
+                $remark = trim($cells[8] ?? '');
+            } elseif (!$isCountry && count($cells) >= 7) {
+                // Continuation row without country: POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
+                $pod = $firstCell;
+                $directTs = trim($cells[1] ?? '');
+                $tt = trim($cells[2] ?? '');
+                $bkkRate20 = trim($cells[3] ?? '');
+                $bkkRate40 = trim($cells[4] ?? '');
+                $lcbRate20 = trim($cells[5] ?? '');
+                $lcbRate40 = trim($cells[6] ?? '');
+                $remark = trim($cells[7] ?? '');
+            } else {
+                continue;
+            }
+
+            // Update current country if new one found
+            if (!empty($country)) {
+                $currentCountry = strtoupper($country);
+            }
+
+            // Skip invalid rows
+            if (empty($pod)) continue;
+            if (preg_match('/^(NIL|N\/A|BY CASE|CHECK)$/i', $bkkRate20) && preg_match('/^(NIL|N\/A|BY CASE|CHECK)$/i', $lcbRate20)) continue;
+
+            // Clean rates - extract numbers only
+            $bkkRate20 = preg_replace('/[^0-9]/', '', $bkkRate20);
+            $bkkRate40 = preg_replace('/[^0-9]/', '', $bkkRate40);
+            $lcbRate20 = preg_replace('/[^0-9]/', '', $lcbRate20);
+            $lcbRate40 = preg_replace('/[^0-9]/', '', $lcbRate40);
+
+            // Format T/T
+            $ttFormatted = !empty($tt) ? $tt . ' Days' : 'TBA';
+
+            // Format T/S
+            $ts = 'TBA';
+            if (stripos($directTs, 'DIRECT') !== false) {
+                $ts = 'DIRECT';
+            } elseif (preg_match('/T\/S\s*(via\s*)?(\w+)/i', $directTs, $tsMatch)) {
+                $ts = 'T/S ' . strtoupper($tsMatch[2]);
+            }
+
+            // Build remark from country and any additional info
+            $fullRemark = $currentCountry;
+            if (!empty($remark) && !preg_match('/^(N\/A|RMB|USD)/i', $remark)) {
+                $fullRemark = $fullRemark . '; ' . $remark;
+            }
+
+            // Create rate entry for BKK if has rates
+            if (!empty($bkkRate20) || !empty($bkkRate40)) {
+                $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, $bkkRate20, $bkkRate40, [
+                    'T/T' => $ttFormatted,
+                    'T/S' => $ts,
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => trim($fullRemark),
+                ]);
+            }
+
+            // Create rate entry for LCB if has rates and different from BKK
+            if ((!empty($lcbRate20) || !empty($lcbRate40)) &&
+                ($lcbRate20 !== $bkkRate20 || $lcbRate40 !== $bkkRate40)) {
+                $rates[] = $this->createRateEntry('TS LINE', 'LCB', $pod, $lcbRate20, $lcbRate40, [
+                    'T/T' => $ttFormatted,
+                    'T/S' => $ts,
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => trim($fullRemark),
+                ]);
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
      * Parse generic table format
      */
     protected function parseGenericTable(array $lines, string $pattern, string $validity): array
@@ -1382,6 +1562,18 @@ class RateExtractionService
             $month = strtoupper($matches[2]);  // e.g., "NOV"
             $year = $matches[3];  // e.g., "2025"
             return $dateRange . ' ' . $month . ' ' . $year;
+        }
+
+        // Pattern 3: "OF 1 - 15 Nov. 25" or "1-15 Nov 25" (TS LINE format)
+        if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*[\'`]?(\d{2,4})/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = $matches[4];
+            if (strlen($year) == 2) {
+                $year = '20' . $year;
+            }
+            return "{$startDay}-{$endDay} {$month} {$year}";
         }
 
         return strtoupper(date('M Y'));

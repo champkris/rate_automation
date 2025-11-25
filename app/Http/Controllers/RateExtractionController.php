@@ -262,6 +262,7 @@ class RateExtractionController extends Controller
             if (preg_match('/BOXMAN/i', $filename)) return 'BOXMAN';
             if (preg_match('/SITC/i', $filename)) return 'SITC';
             if (preg_match('/INDIA|WANHAI/i', $filename)) return 'WANHAI';
+            if (preg_match('/T\.?S\.?\s*LINE|RATE.?1ST/i', $filename)) return 'TS_LINE';
 
             // Fall back to carrier from rates
             return $this->getPrimaryCarrier($rates);
