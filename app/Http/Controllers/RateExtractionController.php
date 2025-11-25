@@ -1,0 +1,208 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\RateExtractionService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+class RateExtractionController extends Controller
+{
+    protected RateExtractionService $extractionService;
+
+    public function __construct(RateExtractionService $extractionService)
+    {
+        $this->extractionService = $extractionService;
+    }
+
+    /**
+     * Show the upload form
+     */
+    public function index()
+    {
+        $patterns = $this->extractionService->getAvailablePatterns();
+        return view('rate-extraction.index', compact('patterns'));
+    }
+
+    /**
+     * Process the uploaded file
+     */
+    public function process(Request $request)
+    {
+        $request->validate([
+            'rate_file' => 'required|file|mimes:xlsx,xls,csv,pdf|max:10240',
+            'pattern' => 'required|string',
+            'validity' => 'nullable|string',
+        ]);
+
+        $file = $request->file('rate_file');
+        $pattern = $request->input('pattern');
+        $validity = $request->input('validity') ?? '';
+
+        // Store the file temporarily - sanitize filename to remove spaces
+        $originalName = $file->getClientOriginalName();
+        $sanitizedName = preg_replace('/[^a-zA-Z0-9._-]/', '_', $originalName);
+        $filename = time() . '_' . $sanitizedName;
+
+        // Ensure temp directory exists
+        $tempDir = storage_path('app/temp_uploads');
+        if (!is_dir($tempDir)) {
+            mkdir($tempDir, 0755, true);
+        }
+
+        // Move file directly instead of using storeAs
+        $fullPath = $tempDir . '/' . $filename;
+        $file->move($tempDir, $filename);
+
+        if (!file_exists($fullPath)) {
+            return back()->with('error', 'Failed to upload file. Please try again.');
+        }
+
+        try {
+            // Extract rates using the selected pattern
+            $rates = $this->extractionService->extractRates($fullPath, $pattern, $validity);
+
+            if (empty($rates)) {
+                return back()->with('error', 'No rates could be extracted from the file. Please check the file format and selected pattern.');
+            }
+
+            // Generate output Excel file
+            $outputFilename = 'extracted_rates_' . time() . '.xlsx';
+            $outputPath = storage_path('app/extracted/' . $outputFilename);
+
+            // Ensure directory exists
+            if (!is_dir(dirname($outputPath))) {
+                mkdir(dirname($outputPath), 0755, true);
+            }
+
+            $this->generateExcel($rates, $outputPath);
+
+            // Store session data for download
+            session([
+                'extracted_file' => $outputFilename,
+                'extracted_count' => count($rates),
+                'carrier_summary' => $this->getCarrierSummary($rates),
+            ]);
+
+            // Clean up temp file
+            @unlink($fullPath);
+
+            return redirect()->route('rate-extraction.result');
+
+        } catch (\Exception $e) {
+            // Clean up temp file on error
+            @unlink($fullPath);
+
+            return back()->with('error', 'Error processing file: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Show extraction result
+     */
+    public function result()
+    {
+        $filename = session('extracted_file');
+        $count = session('extracted_count', 0);
+        $carrierSummary = session('carrier_summary', []);
+
+        if (!$filename) {
+            return redirect()->route('rate-extraction.index')
+                ->with('error', 'No extraction result found. Please upload a file first.');
+        }
+
+        return view('rate-extraction.result', compact('filename', 'count', 'carrierSummary'));
+    }
+
+    /**
+     * Download the extracted file
+     */
+    public function download($filename)
+    {
+        $path = storage_path('app/extracted/' . $filename);
+
+        if (!file_exists($path)) {
+            return redirect()->route('rate-extraction.index')
+                ->with('error', 'File not found. Please extract again.');
+        }
+
+        return response()->download($path, 'extracted_rates.xlsx', [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ])->deleteFileAfterSend(true);
+    }
+
+    /**
+     * Generate Excel file from rates array
+     */
+    protected function generateExcel(array $rates, string $outputPath): void
+    {
+        $headers = [
+            'CARRIER', 'POL', 'POD', 'CUR', "20'", "40'", '40 HQ', '20 TC', '20 RF', '40RF',
+            'ETD BKK', 'ETD LCH', 'T/T', 'T/S', 'FREE TIME', 'VALIDITY', 'REMARK',
+            'Export', 'Who use?', 'Rate Adjust', '1.1'
+        ];
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('FCL_EXP');
+
+        // Write headers
+        foreach ($headers as $index => $header) {
+            $col = chr(65 + $index);
+            $sheet->setCellValue($col . '1', $header);
+        }
+
+        // Style headers
+        $sheet->getStyle('A1:U1')->getFont()->setBold(true);
+        $sheet->getStyle('A1:U1')->getFill()
+            ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+            ->getStartColor()->setARGB('FFD9D9D9');
+
+        // Write data
+        $rowNum = 2;
+        foreach ($rates as $rate) {
+            foreach ($headers as $index => $header) {
+                $col = chr(65 + $index);
+                $value = $rate[$header] ?? '';
+                $sheet->setCellValue($col . $rowNum, $value);
+            }
+
+            // Apply black highlighting if flagged
+            if (isset($rate['_isBlackRow']) && $rate['_isBlackRow'] === true) {
+                $sheet->getStyle('A' . $rowNum . ':U' . $rowNum)->getFill()
+                    ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+                    ->getStartColor()->setARGB('FF000000');
+                $sheet->getStyle('A' . $rowNum . ':U' . $rowNum)->getFont()
+                    ->getColor()->setARGB('FFFFFFFF');
+            }
+
+            $rowNum++;
+        }
+
+        // Auto-size columns
+        foreach (range('A', 'U') as $columnID) {
+            $sheet->getColumnDimension($columnID)->setAutoSize(true);
+        }
+
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($outputPath);
+    }
+
+    /**
+     * Get carrier summary from rates
+     */
+    protected function getCarrierSummary(array $rates): array
+    {
+        $summary = [];
+        foreach ($rates as $rate) {
+            $carrier = trim($rate['CARRIER'] ?? 'Unknown');
+            if ($carrier) {
+                $summary[$carrier] = ($summary[$carrier] ?? 0) + 1;
+            }
+        }
+        arsort($summary);
+        return $summary;
+    }
+}
