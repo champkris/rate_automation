@@ -79,11 +79,18 @@ class RateExtractionController extends Controller
 
             $this->generateExcel($rates, $outputPath);
 
+            // Get carrier name from pattern or rates for download filename
+            // Use pattern name if specific (not auto), otherwise use carrier from rates
+            $carrierName = $this->getCarrierNameFromPattern($pattern, $originalName, $rates);
+            $validityPeriod = $this->getValidityPeriod($rates);
+            $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod);
+
             // Store session data for download
             session([
                 'extracted_file' => $outputFilename,
                 'extracted_count' => count($rates),
                 'carrier_summary' => $this->getCarrierSummary($rates),
+                'download_filename' => $downloadFilename,
             ]);
 
             // Clean up temp file
@@ -128,7 +135,10 @@ class RateExtractionController extends Controller
                 ->with('error', 'File not found. Please extract again.');
         }
 
-        return response()->download($path, 'extracted_rates.xlsx', [
+        // Get the download filename from session or use default
+        $downloadFilename = session('download_filename', 'extracted_rates.xlsx');
+
+        return response()->download($path, $downloadFilename, [
             'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         ])->deleteFileAfterSend(true);
     }
@@ -204,5 +214,95 @@ class RateExtractionController extends Controller
         }
         arsort($summary);
         return $summary;
+    }
+
+    /**
+     * Get the primary carrier from rates (most common one)
+     */
+    protected function getPrimaryCarrier(array $rates): string
+    {
+        $summary = $this->getCarrierSummary($rates);
+        return array_key_first($summary) ?? 'UNKNOWN';
+    }
+
+    /**
+     * Get carrier name from pattern for download filename
+     * Maps pattern keys to display names (e.g., sinokor_skr -> SINOKOR_SKR)
+     */
+    protected function getCarrierNameFromPattern(string $pattern, string $originalFilename, array $rates): string
+    {
+        // Pattern name mapping
+        $patternNames = [
+            'rcl' => 'RCL',
+            'kmtc' => 'KMTC',
+            'sinokor' => 'SINOKOR',
+            'sinokor_skr' => 'SINOKOR_SKR',
+            'heung_a' => 'HEUNG_A',
+            'boxman' => 'BOXMAN',
+            'sitc' => 'SITC',
+            'wanhai' => 'WANHAI',
+            'ck_line' => 'CK_LINE',
+            'sm_line' => 'SM_LINE',
+            'dongjin' => 'DONGJIN',
+            'ts_line' => 'TS_LINE',
+        ];
+
+        // If pattern is auto, detect from filename
+        if ($pattern === 'auto') {
+            $filename = strtoupper($originalFilename);
+
+            // Check SKR pattern before generic SINOKOR
+            if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) {
+                return 'SINOKOR_SKR';
+            }
+            if (preg_match('/SINOKOR/i', $filename)) return 'SINOKOR';
+            if (preg_match('/FAK.?RATE/i', $filename)) return 'RCL';
+            if (preg_match('/UPDATED.?RATE/i', $filename)) return 'KMTC';
+            if (preg_match('/HEUNG.?A|HUANG.?A/i', $filename)) return 'HEUNG_A';
+            if (preg_match('/BOXMAN/i', $filename)) return 'BOXMAN';
+            if (preg_match('/SITC/i', $filename)) return 'SITC';
+            if (preg_match('/INDIA|WANHAI/i', $filename)) return 'WANHAI';
+
+            // Fall back to carrier from rates
+            return $this->getPrimaryCarrier($rates);
+        }
+
+        return $patternNames[$pattern] ?? $this->getPrimaryCarrier($rates);
+    }
+
+    /**
+     * Get validity period from rates
+     */
+    protected function getValidityPeriod(array $rates): string
+    {
+        foreach ($rates as $rate) {
+            $validity = trim($rate['VALIDITY'] ?? '');
+            if (!empty($validity)) {
+                return $validity;
+            }
+        }
+        return strtoupper(date('M Y'));
+    }
+
+    /**
+     * Generate download filename from carrier and validity
+     * Example: "SINOKOR_1-30_NOV_2025.xlsx"
+     */
+    protected function generateDownloadFilename(string $carrier, string $validity): string
+    {
+        // Clean carrier name (remove special characters, keep alphanumeric and spaces)
+        $cleanCarrier = preg_replace('/[^a-zA-Z0-9\s]/', '', $carrier);
+        $cleanCarrier = trim($cleanCarrier);
+        $cleanCarrier = str_replace(' ', '_', $cleanCarrier);
+
+        // Clean validity (replace spaces with underscores)
+        $cleanValidity = str_replace(' ', '_', $validity);
+        $cleanValidity = preg_replace('/[^a-zA-Z0-9_-]/', '', $cleanValidity);
+
+        if (empty($cleanCarrier)) {
+            $cleanCarrier = 'RATES';
+        }
+
+        return strtoupper($cleanCarrier) . '_' . strtoupper($cleanValidity) . '.xlsx';
     }
 }

@@ -14,7 +14,8 @@ class RateExtractionService
         'auto' => 'Auto-detect from filename',
         'rcl' => 'RCL (FAK Rate)',
         'kmtc' => 'KMTC (Updated Rate)',
-        'sinokor' => 'SINOKOR',
+        'sinokor' => 'SINOKOR (Main Rate Card)',
+        'sinokor_skr' => 'SINOKOR SKR (HK Feederage)',
         'heung_a' => 'HEUNG A',
         'boxman' => 'BOXMAN',
         'sitc' => 'SITC',
@@ -66,6 +67,8 @@ class RateExtractionService
         // Use .? to match optional space, underscore, or hyphen
         if (preg_match('/FAK.?RATE.?OF/i', $filename)) return 'rcl';
         if (preg_match('/UPDATED.?RATE/i', $filename)) return 'kmtc';
+        // Check SKR pattern before generic SINOKOR (SKR is the HK feederage table)
+        if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) return 'sinokor_skr';
         if (preg_match('/SINOKOR/i', $filename)) return 'sinokor';
         if (preg_match('/HEUNG.?A|HUANG.?A/i', $filename)) return 'heung_a';
         if (preg_match('/BOXMAN/i', $filename)) return 'boxman';
@@ -91,6 +94,7 @@ class RateExtractionService
             'rcl' => $this->parseRclExcel($worksheet, $validity),
             'kmtc' => $this->parseKmtcExcel($worksheet, $validity),
             'sinokor' => $this->parseSinokorExcel($worksheet, $validity),
+            'sinokor_skr' => $this->parseSinokorSkrExcel($worksheet, $validity),
             'heung_a' => $this->parseHeungAExcel($worksheet, $validity),
             'boxman' => $this->parseBoxmanExcel($worksheet, $validity),
             'sitc' => $this->parseSitcExcel($worksheet, $validity),
@@ -108,6 +112,11 @@ class RateExtractionService
         $azureResultsDir = base_path('temp_attachments/azure_ocr_results/');
         $tableFile = $azureResultsDir . $baseFilename . '_tables.txt';
         $jsonFile = $azureResultsDir . $baseFilename . '_azure_result.json';
+
+        // Try to extract validity from filename first (e.g., "GUIDE RATE FOR 1-30 NOV 2025_SINOKOR")
+        if (empty($validity)) {
+            $validity = $this->extractValidityFromFilename($baseFilename);
+        }
 
         // Check for existing Azure OCR results first
         if (file_exists($tableFile)) {
@@ -146,6 +155,7 @@ class RateExtractionService
 
         return match ($pattern) {
             'sinokor' => $this->parseSinokorTable($lines, $validity),
+            'sinokor_skr' => $this->parseSinokorSkrTable($lines, $validity),
             'heung_a' => $this->parseHeungATable($lines, $validity),
             'boxman' => $this->parseBoxmanTable($lines, $validity),
             'sitc' => $this->parseSitcTable($lines, $validity),
@@ -392,6 +402,12 @@ class RateExtractionService
     {
         $rates = [];
         $pendingPod = ''; // Track POD that has incomplete rate data
+        $currentCountry = ''; // Track current country for remarks
+
+        // Extract validity from title if not provided (e.g., "GUIDE RATE FOR 1-30 NOV 2025")
+        if (empty($validity)) {
+            $validity = $this->extractSinokorValidity($lines);
+        }
 
         for ($i = 0; $i < count($lines); $i++) {
             $line = $lines[$i];
@@ -404,8 +420,8 @@ class RateExtractionService
                     $rate20 = preg_replace('/[^0-9]/', '', trim($cells[0] ?? ''));
                     $rate40 = preg_replace('/[^0-9]/', '', trim($cells[1] ?? ''));
                     if (!empty($rate20) || !empty($rate40)) {
-                        // Extract remark from pending POD
-                        [$cleanPod, $remark] = $this->extractSinokorRemark($pendingPod);
+                        // Extract remark from pending POD with country
+                        [$cleanPod, $remark] = $this->extractSinokorRemark($pendingPod, $currentCountry);
                         $rates[] = $this->createRateEntry('SINOKOR', 'BKK/LCH', $cleanPod, $rate20, $rate40, [
                             'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                             'REMARK' => $remark,
@@ -427,22 +443,34 @@ class RateExtractionService
             $pod = '';
             $rate20 = '';
             $rate40 = '';
+            $country = '';
 
-            if (count($cells) >= 8) {
-                // Full row with 8+ columns
-                $pod = trim($cells[3] ?? '');
-                $rate20 = trim($cells[6] ?? '');
-                $rate40 = trim($cells[7] ?? '');
-            } elseif (count($cells) >= 4) {
+            if (count($cells) >= 4) {
                 // 4 columns: COUNTRY | POD | 20' | 40'
+                $country = trim($cells[0] ?? '');
                 $pod = trim($cells[1] ?? '');
                 $rate20 = trim($cells[2] ?? '');
                 $rate40 = trim($cells[3] ?? '');
             } elseif (count($cells) == 3) {
-                // 3 columns: POD | 20' | 40' (continuation rows without country)
-                $pod = trim($cells[0] ?? '');
-                $rate20 = trim($cells[1] ?? '');
-                $rate40 = trim($cells[2] ?? '');
+                // Could be: POD | 20' | 40' (continuation) OR COUNTRY | POD | REMARK (header row)
+                $cell0 = trim($cells[0] ?? '');
+                $cell1 = trim($cells[1] ?? '');
+                $cell2 = trim($cells[2] ?? '');
+
+                // Check if this is a country header row (3rd column is not numeric, contains text)
+                // e.g., "S.CHINA | S.CHINA T/S HKG | SELL AT PRD SALES GUIDE"
+                if (!preg_match('/^\d+$/', $cell2) && preg_match('/[A-Za-z]{3,}/', $cell2)) {
+                    // This is a country header row
+                    $country = $cell0;
+                    $pod = $cell1;
+                    $rate20 = $cell2; // Will be skipped by SELL/GUIDE check below
+                    $rate40 = '';
+                } else {
+                    // Standard continuation row: POD | 20' | 40'
+                    $pod = $cell0;
+                    $rate20 = $cell1;
+                    $rate40 = $cell2;
+                }
             } elseif (count($cells) == 2) {
                 // 2 columns: could be "POD | --------" or rates for pending POD
                 $firstCell = trim($cells[0] ?? '');
@@ -459,7 +487,7 @@ class RateExtractionService
                     $rate20 = preg_replace('/[^0-9]/', '', $firstCell);
                     $rate40 = preg_replace('/[^0-9]/', '', $secondCell);
                     if (!empty($rate20) || !empty($rate40)) {
-                        [$cleanPod, $remark] = $this->extractSinokorRemark($pendingPod);
+                        [$cleanPod, $remark] = $this->extractSinokorRemark($pendingPod, $currentCountry);
                         $rates[] = $this->createRateEntry('SINOKOR', 'BKK/LCH', $cleanPod, $rate20, $rate40, [
                             'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                             'REMARK' => $remark,
@@ -467,6 +495,17 @@ class RateExtractionService
                     }
                     $pendingPod = '';
                 }
+                continue;
+            }
+
+            // Update current country if we got a new one (do this BEFORE any skip checks)
+            if (!empty($country) && !preg_match('/^\d+$/', $country)) {
+                $currentCountry = $country;
+            }
+
+            // Skip rows with text in rate column (e.g., "SELL AT PRD SALES GUIDE")
+            // Note: country is already updated above so continuation rows get correct country
+            if (preg_match('/SELL|GUIDE|CHECK|TBA/i', $rate20) || preg_match('/SELL|GUIDE|CHECK|TBA/i', $rate40)) {
                 continue;
             }
 
@@ -479,17 +518,12 @@ class RateExtractionService
                 continue;
             }
 
-            // Skip rows with text in rate column (e.g., "SELL AT PRD SALES GUIDE")
-            if (preg_match('/SELL|GUIDE|CHECK|TBA/i', $rate20) || preg_match('/SELL|GUIDE|CHECK|TBA/i', $rate40)) {
-                continue;
-            }
-
             $rate20 = preg_replace('/[^0-9]/', '', $rate20);
             $rate40 = preg_replace('/[^0-9]/', '', $rate40);
 
             if (!empty($pod) && (!empty($rate20) || !empty($rate40))) {
-                // Extract remark from POD (e.g., "T/S PUS", "LCH ONLY", etc.)
-                [$cleanPod, $remark] = $this->extractSinokorRemark($pod);
+                // Extract remark from POD with country-specific remarks
+                [$cleanPod, $remark] = $this->extractSinokorRemark($pod, $currentCountry);
                 $rates[] = $this->createRateEntry('SINOKOR', 'BKK/LCH', $cleanPod, $rate20, $rate40, [
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                     'REMARK' => $remark,
@@ -501,39 +535,211 @@ class RateExtractionService
     }
 
     /**
-     * Extract remark from SINOKOR POD column
+     * Parse SINOKOR SKR feederage table format (8-column via Hong Kong)
+     * Structure: POL_CODE | POL_NAME | POD_CODE | POD_NAME | T/T | Type | 20' | 40'
+     * Note: OCR sometimes merges last two columns as "250 400" instead of "250 | 400"
+     */
+    protected function parseSinokorSkrTable(array $lines, string $validity): array
+    {
+        $rates = [];
+
+        // Extract validity from title if not provided (e.g., "GUIDE RATE FOR 1-30 NOV 2025")
+        if (empty($validity)) {
+            $validity = $this->extractSinokorValidity($lines);
+        }
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+
+            // Need at least 7 columns (8 if properly separated, 7 if rates are merged)
+            if (count($cells) < 7) continue;
+
+            // Skip header rows
+            if (preg_match('/(POL|POD|20offer|Feederage|SINOKOR)/i', $cells[0] ?? '')) continue;
+
+            $polCode = trim($cells[0] ?? '');
+            $polName = trim($cells[1] ?? '');
+            $podCode = trim($cells[2] ?? '');
+            $podName = trim($cells[3] ?? '');
+            $transitTime = trim($cells[4] ?? '');
+            $containerType = trim($cells[5] ?? '');
+            $rate20 = '';
+            $rate40 = '';
+
+            if (count($cells) >= 8) {
+                // Normal case: 8 columns with separate rates
+                $rate20 = trim($cells[6] ?? '');
+                $rate40 = trim($cells[7] ?? '');
+            } elseif (count($cells) == 7) {
+                // OCR merged rates case: "250 400" in single column
+                $mergedRates = trim($cells[6] ?? '');
+                // Split by space to get both rates
+                if (preg_match('/^(\d+)\s+(\d+)$/', $mergedRates, $rateMatch)) {
+                    $rate20 = $rateMatch[1];
+                    $rate40 = $rateMatch[2];
+                } else {
+                    // If can't parse, use as rate20 only
+                    $rate20 = $mergedRates;
+                }
+            }
+
+            // Skip non-data rows
+            if (empty($podName) || preg_match('/^(POD|NAME|Type)/i', $podName)) continue;
+
+            // Clean rates
+            $rate20 = preg_replace('/[^0-9]/', '', $rate20);
+            $rate40 = preg_replace('/[^0-9]/', '', $rate40);
+
+            if (empty($rate20) && empty($rate40)) continue;
+
+            // Format T/T
+            $tt = !empty($transitTime) ? $transitTime . ' Days' : 'TBA';
+
+            // SKR feederage table has no remarks - leave empty
+            // Only add container type if not GP (e.g., TN for tank container)
+            $remark = '';
+            if (!empty($containerType) && strtoupper($containerType) !== 'GP') {
+                $remark = strtoupper($containerType);
+            }
+
+            $rates[] = $this->createRateEntry('SINOKOR', $polName ?: 'HONG KONG', $podName, $rate20, $rate40, [
+                'T/T' => $tt,
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse SINOKOR SKR Excel format (placeholder - uses generic)
+     */
+    protected function parseSinokorSkrExcel($worksheet, string $validity): array
+    {
+        return $this->parseGenericExcel($worksheet, $validity, 'SINOKOR');
+    }
+
+    /**
+     * Extract remark from SINOKOR POD column and get country-specific remarks
      * Remarks are typically in parentheses: MANZANILLO (T/S PUS), CHENNAI (LCH ONLY)
      */
-    protected function extractSinokorRemark(string $pod): array
+    protected function extractSinokorRemark(string $pod, string $country = ''): array
     {
-        $remark = '';
+        $podRemark = '';
         $cleanPod = $pod;
 
-        // Extract text in parentheses as remark
+        // Extract text in parentheses as POD-specific remark
         if (preg_match('/^(.+?)\s*\(([^)]+)\)(.*)$/', $pod, $matches)) {
             $cleanPod = trim($matches[1]);
-            $remark = trim($matches[2]);
+            $podRemark = trim($matches[2]);
 
             // Check for additional parentheses (e.g., "PORT KLANG (WEST) (LCH ONLY)")
             if (!empty($matches[3]) && preg_match('/\(([^)]+)\)/', $matches[3], $extraMatch)) {
-                $remark = trim($extraMatch[1]);
-                $cleanPod = trim($matches[1] . ' ' . $matches[2]);
+                $podRemark = trim($extraMatch[1]);
+                $cleanPod = trim($matches[1] . ' (' . $matches[2] . ')');
             }
         }
 
         // Also check for T/S patterns not in parentheses
-        if (empty($remark) && preg_match('/\bT\/S\s+(\w+)/i', $pod, $tsMatch)) {
-            $remark = 'T/S ' . $tsMatch[1];
+        if (empty($podRemark) && preg_match('/\bT\/S\s+(\w+)/i', $pod, $tsMatch)) {
+            $podRemark = 'T/S ' . $tsMatch[1];
             $cleanPod = preg_replace('/\s*T\/S\s+\w+/i', '', $pod);
         }
 
-        // Add default remark "INCL LSS" if no specific remark found
-        // This is the common remark for SINOKOR rates (OCF INCL LSS)
-        if (empty($remark)) {
-            $remark = 'INCL LSS';
+        // Get country-specific full remark from mapping
+        $countryRemark = $this->getSinokorCountryRemark($country, $cleanPod);
+
+        // Combine POD remark with country remark
+        $fullRemark = $countryRemark;
+        if (!empty($podRemark) && stripos($countryRemark, $podRemark) === false) {
+            $fullRemark = $podRemark . '; ' . $countryRemark;
         }
 
-        return [trim($cleanPod), $remark];
+        return [trim($cleanPod), $fullRemark];
+    }
+
+    /**
+     * Get SINOKOR country-specific remarks based on the PDF structure
+     */
+    protected function getSinokorCountryRemark(string $country, string $pod = ''): string
+    {
+        $remarks = [
+            'MAXICO' => '1) OCF INCL LSS',
+            'C.CHINA' => '1) OCF INCL LSS / SUBJ.TO AFR $30/BL; 2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
+            'INDIA' => '1) OCF INCL LSS; 2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
+            'MALAYSIA' => '1) OCF INCL LSS; 2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
+            'HONGKONG' => '1) OCF INCL LSS; 2) PCS AT DESTINATION $100/$200 IS WAIVED; 3) RICE SHIPMENT $100/20DC INCL LSS, DTHC HKD $1500/20DC; 4) DG MUST BE ADDED ON AT LEAST $100/TEU; 5) CONSOL $100/$200 INCL LSS (SUBJECT TO EQUIPMENT AVAILABLE); 6) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+            'S.CHINA' => '1) OCF INCL LSS; 2) PCS AT DESTINATION $100/$200 IS WAIVED; 3) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 4) SUBJ.TO AFR $30/BL',
+            'N.CHINA' => 'OCF INCL LSS; SUBJ.TO AFR $30/BL',
+            'HOCHIMINH' => '1) OCF INCL LSS; 2) CIC AT DESTINATION WAIVED; 3) CONSOL $70/$140 INCL LSS (SUBJECT EQUIPMENT AVAILABLE); 4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 5) DG MUST BE ADDED ON AT LEAST $100/TEU',
+            'INDONESIA' => '1) OCF INCL LSS; 2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE; 3) DG MUST BE ADDED ON AT LEAST $100/TEU',
+            'TAIWAN' => 'OCF INCL LSS',
+            'JP(MAIN PORT)' => 'OCF INCL LSS',
+            'JP(OUT PORT)' => 'OCF INCL LSS / SUBJ.TO AFR $30/BL',
+            'RUSSIA' => 'OCF INCL LSS',
+            'S.KOREA' => '1) OCF INCL LSF / NES / CIS / CRS; 2) CONSOL PUS $420/840 + LSF (INCL NES + CRS); 3) CONSOL INC,PKT $520/1040 + LSF (INCL NES + CRS + CIS); 4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 5) DG MUST BE ADDED ON AT LEAST $100/TEU',
+        ];
+
+        // Normalize country name (remove spaces for matching)
+        $countryUpper = strtoupper(trim($country));
+        $countryNormalized = str_replace(' ', '', $countryUpper);
+
+        // Direct match
+        if (isset($remarks[$countryUpper])) {
+            return $remarks[$countryUpper];
+        }
+
+        // Try normalized match (e.g., "HONG KONG" -> "HONGKONG")
+        if (isset($remarks[$countryNormalized])) {
+            return $remarks[$countryNormalized];
+        }
+
+        // Try partial matches
+        foreach ($remarks as $key => $remark) {
+            $keyNormalized = str_replace(' ', '', $key);
+            if (stripos($countryNormalized, $keyNormalized) !== false ||
+                stripos($keyNormalized, $countryNormalized) !== false ||
+                stripos($countryUpper, $key) !== false ||
+                stripos($key, $countryUpper) !== false) {
+                return $remark;
+            }
+        }
+
+        // Default remark
+        return 'OCF INCL LSS';
+    }
+
+    /**
+     * Extract validity from SINOKOR title/filename
+     * Pattern: "GUIDE RATE FOR 1-30 NOV 2025" or "GUIDELINE RATE FOR 1-30 NOV 2025"
+     */
+    protected function extractSinokorValidity(array $lines): string
+    {
+        // Check first few lines and filename line for validity pattern
+        foreach ($lines as $line) {
+            // Match patterns like "1-30 NOV 2025", "1-31 DEC 2025", etc.
+            if (preg_match('/(\d{1,2}[-\s]*\d{0,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s*(\d{4})/i', $line, $matches)) {
+                $dateRange = trim($matches[1]);
+                $month = strtoupper($matches[2]);
+                $year = $matches[3];
+
+                // Clean up date range (e.g., "1-30" or "1 - 30" -> "1-30")
+                $dateRange = preg_replace('/\s+/', '', $dateRange);
+
+                // If only single date, assume full month
+                if (!str_contains($dateRange, '-')) {
+                    $dateRange = '1-' . $dateRange;
+                }
+
+                return strtoupper("{$dateRange} {$month} {$year}");
+            }
+        }
+
+        // Default to current month
+        return strtoupper(date('M Y'));
     }
 
     /**
@@ -1118,6 +1324,27 @@ class RateExtractionService
         }
 
         return $validityRaw;
+    }
+
+    /**
+     * Extract validity from filename
+     * Pattern: "GUIDE RATE FOR 1-30 NOV 2025_SINOKOR" or "GUIDELINE RATE FOR 1-30 NOV 2025"
+     * Also handles underscores: "1764088043_GUIDE_RATE_FOR_1-30_NOV_2025_SINOKOR"
+     */
+    protected function extractValidityFromFilename(string $filename): string
+    {
+        // Match patterns like "1-30 NOV 2025", "1-31_DEC_2025", etc. (spaces or underscores)
+        if (preg_match('/(\d{1,2})[-_\s]*(\d{1,2})[-_\s]*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*[-_\s]*(\d{4})/i', $filename, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper($matches[3]);
+            $year = $matches[4];
+
+            return strtoupper("{$startDay}-{$endDay} {$month} {$year}");
+        }
+
+        // Return empty to allow fallback to other methods
+        return '';
     }
 
     /**

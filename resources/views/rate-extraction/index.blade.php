@@ -111,7 +111,8 @@
                 <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
                     <div class="text-sm"><span class="font-medium">RCL</span> - FAK Rate</div>
                     <div class="text-sm"><span class="font-medium">KMTC</span> - Updated Rate</div>
-                    <div class="text-sm"><span class="font-medium">SINOKOR</span></div>
+                    <div class="text-sm"><span class="font-medium">SINOKOR</span> - Main Rate Card</div>
+                    <div class="text-sm"><span class="font-medium">SINOKOR SKR</span> - HK Feederage</div>
                     <div class="text-sm"><span class="font-medium">HEUNG A</span></div>
                     <div class="text-sm"><span class="font-medium">BOXMAN</span></div>
                     <div class="text-sm"><span class="font-medium">SITC</span></div>
