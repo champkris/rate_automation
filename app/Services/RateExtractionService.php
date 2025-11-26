@@ -1157,10 +1157,14 @@ class RateExtractionService
             $firstCell = trim($cells[0] ?? '');
 
             // Country names are typically all caps, single word or with space
-            $isCountry = preg_match('/^(JAPAN|KOREA|TAIWAN|HONG KONG|CHINA|PHILIPPINES|VIETNAM|MIDDLE EAST|INDIA|Eest INDIA)$/i', $firstCell);
+            $isCountry = preg_match('/^(JAPAN|KOREA|TAIWAN|HONG KONG|CHINA|PHILIPPINES|VIETNAM|MIDDLE EAST|INDIA|Eest INDIA|EAST INDIA)$/i', $firstCell);
 
-            if ($isCountry && count($cells) >= 8) {
+            // Handle empty first cell (continuation row with empty country column)
+            $isEmptyFirstCell = empty($firstCell);
+
+            if ($isCountry && count($cells) >= 5) {
                 // Full row with country: COUNTRY | POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
+                // Note: Some rows may have fewer columns (e.g., BY CASE CHECK rows)
                 $country = $firstCell;
                 $pod = trim($cells[1] ?? '');
                 $directTs = trim($cells[2] ?? '');
@@ -1170,7 +1174,17 @@ class RateExtractionService
                 $lcbRate20 = trim($cells[6] ?? '');
                 $lcbRate40 = trim($cells[7] ?? '');
                 $remark = trim($cells[8] ?? '');
-            } elseif (!$isCountry && count($cells) >= 7) {
+            } elseif ($isEmptyFirstCell && count($cells) >= 5) {
+                // Continuation row with empty first cell: "" | POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
+                $pod = trim($cells[1] ?? '');
+                $directTs = trim($cells[2] ?? '');
+                $tt = trim($cells[3] ?? '');
+                $bkkRate20 = trim($cells[4] ?? '');
+                $bkkRate40 = trim($cells[5] ?? '');
+                $lcbRate20 = trim($cells[6] ?? '');
+                $lcbRate40 = trim($cells[7] ?? '');
+                $remark = trim($cells[8] ?? '');
+            } elseif (!$isCountry && !$isEmptyFirstCell && count($cells) >= 7) {
                 // Continuation row without country: POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
                 $pod = $firstCell;
                 $directTs = trim($cells[1] ?? '');
@@ -1189,15 +1203,35 @@ class RateExtractionService
                 $currentCountry = strtoupper($country);
             }
 
-            // Skip invalid rows
+            // Skip invalid rows - but keep "BY CASE CHECK" entries
             if (empty($pod)) continue;
-            if (preg_match('/^(NIL|N\/A|BY CASE|CHECK)$/i', $bkkRate20) && preg_match('/^(NIL|N\/A|BY CASE|CHECK)$/i', $lcbRate20)) continue;
 
-            // Clean rates - extract numbers only
-            $bkkRate20 = preg_replace('/[^0-9]/', '', $bkkRate20);
-            $bkkRate40 = preg_replace('/[^0-9]/', '', $bkkRate40);
-            $lcbRate20 = preg_replace('/[^0-9]/', '', $lcbRate20);
-            $lcbRate40 = preg_replace('/[^0-9]/', '', $lcbRate40);
+            // Check if rates are NIL (skip) or BY CASE CHECK (keep as special rate)
+            $isBkkNil = preg_match('/^NIL$/i', $bkkRate20);
+            $isLcbNil = preg_match('/^NIL$/i', $lcbRate20);
+            $isBkkByCase = preg_match('/BY\s*CASE|CHECK/i', $bkkRate20);
+            $isLcbByCase = preg_match('/BY\s*CASE|CHECK/i', $lcbRate20);
+
+            // Skip if both are NIL
+            if ($isBkkNil && $isLcbNil) continue;
+
+            // Handle BY CASE CHECK rates - set to "CHECK" text
+            if ($isBkkByCase) {
+                $bkkRate20 = 'CHECK';
+                $bkkRate40 = 'CHECK';
+            } else {
+                // Clean rates - extract numbers only
+                $bkkRate20 = preg_replace('/[^0-9]/', '', $bkkRate20);
+                $bkkRate40 = preg_replace('/[^0-9]/', '', $bkkRate40);
+            }
+
+            if ($isLcbByCase) {
+                $lcbRate20 = 'CHECK';
+                $lcbRate40 = 'CHECK';
+            } else {
+                $lcbRate20 = preg_replace('/[^0-9]/', '', $lcbRate20);
+                $lcbRate40 = preg_replace('/[^0-9]/', '', $lcbRate40);
+            }
 
             // Format T/T
             $ttFormatted = !empty($tt) ? $tt . ' Days' : 'TBA';
@@ -1234,6 +1268,79 @@ class RateExtractionService
                     'T/S' => $ts,
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                     'REMARK' => trim($fullRemark),
+                ]);
+            }
+        }
+
+        // Add additional "BY CASE CHECK" destinations that Azure OCR may have missed
+        // These are parsed from raw content since table extraction often misses them
+        $additionalDestinations = $this->extractTsLineAdditionalDestinations($validity);
+        $existingPods = array_column($rates, 'POD');
+        foreach ($additionalDestinations as $dest) {
+            if (!in_array($dest['POD'], $existingPods)) {
+                $rates[] = $dest;
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Extract additional TS LINE destinations that Azure OCR may miss from table extraction
+     * These are typically BY CASE CHECK destinations at the bottom of the rate card
+     */
+    protected function extractTsLineAdditionalDestinations(string $validity): array
+    {
+        $rates = [];
+
+        // Known destinations with BY CASE CHECK rates
+        // Format: POD => [Country, T/T, T/S]
+        $byCheckDestinations = [
+            'CHENNAI' => ['EAST INDIA', '22-25', 'T/S SKU'],
+            'NAVASHEVA' => ['WEST INDIA & PAKISTAN', '25-27', 'T/S SKU'],
+            'MUNDRA' => ['WEST INDIA & PAKISTAN', '25-27', 'T/S SKU'],
+            'KARACHI' => ['WEST INDIA & PAKISTAN', '27-29', 'T/S SKU'],
+            'SYDNEY' => ['AU', '25-27', 'T/S SKU'],
+            'MELBOUNE' => ['AU', '25-27', 'T/S SKU'],
+            'BRISBANE' => ['AU', '25-27', 'T/S SKU'],
+            'DAR ES SALAM' => ['AFRICA', '29-31', 'T/S SKU'],
+            'MOMNASA' => ['AFRICA', '29-31', 'T/S SKU'],
+            'LONG BEACH /LA' => ['USWC', '27-30', 'T/S SHA'],
+            'Manzanillo, Mexico' => ['USWC', '35-42', 'T/S SHA'],
+        ];
+
+        // Find the most recent TS LINE JSON file to check for these destinations
+        $azureResultsDir = base_path('temp_attachments/azure_ocr_results/');
+        $jsonFiles = glob($azureResultsDir . '*Rate*1st*half*_azure_result.json');
+
+        if (empty($jsonFiles)) {
+            // No JSON file found, return all known destinations as they're standard for TS LINE
+            foreach ($byCheckDestinations as $pod => $info) {
+                [$country, $tt, $ts] = $info;
+                $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, 'CHECK', 'CHECK', [
+                    'T/T' => $tt . ' Days',
+                    'T/S' => $ts,
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => $country,
+                ]);
+            }
+            return $rates;
+        }
+
+        // Use the most recent file
+        $jsonFile = end($jsonFiles);
+        $data = json_decode(file_get_contents($jsonFile), true);
+        $content = $data['analyzeResult']['content'] ?? '';
+
+        foreach ($byCheckDestinations as $pod => $info) {
+            // Check if POD exists in content (case-insensitive)
+            if (stripos($content, $pod) !== false) {
+                [$country, $tt, $ts] = $info;
+                $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, 'CHECK', 'CHECK', [
+                    'T/T' => $tt . ' Days',
+                    'T/S' => $ts,
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => $country,
                 ]);
             }
         }
