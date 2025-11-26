@@ -161,6 +161,7 @@ class RateExtractionService
             'sitc' => $this->parseSitcTable($lines, $validity),
             'wanhai' => $this->parseWanhaiTable($lines, $validity),
             'ts_line' => $this->parseTsLineTable($lines, $validity),
+            'dongjin' => $this->parseDongjinTable($lines, $validity),
             default => $this->parseGenericTable($lines, $pattern, $validity),
         };
     }
@@ -1349,6 +1350,140 @@ class RateExtractionService
     }
 
     /**
+     * Parse DONGJIN table format (from Azure OCR)
+     * Structure: POD | Code | Country | Currency | 20' | 40' | T/T | T/S | ETD_BKK | ETD_LCH
+     * Some rows have fewer columns (continuation rows without country)
+     */
+    protected function parseDongjinTable(array $lines, string $validity): array
+    {
+        $rates = [];
+
+        // Extract validity from filename pattern "1-30 Nov" if not provided
+        if (empty($validity)) {
+            foreach ($lines as $line) {
+                if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i', $line, $matches)) {
+                    $startDay = $matches[1];
+                    $endDay = $matches[2];
+                    $month = strtoupper(substr($matches[3], 0, 3));
+                    $year = date('Y');
+                    $validity = "{$startDay}-{$endDay} {$month} {$year}";
+                    break;
+                }
+            }
+            if (empty($validity)) {
+                $validity = strtoupper(date('M Y'));
+            }
+        }
+
+        foreach ($lines as $line) {
+            // Skip header row and table markers
+            if (preg_match('/^TABLE \d+|^-{10,}|^Row 0:|Destination port|Currency/i', $line)) {
+                continue;
+            }
+
+            // Match data rows: Row N: POD | Code | Country | Currency | 20' | 40' | T/T | T/S | ETD_BKK | ETD_LCH
+            if (!preg_match('/^Row \d+:\s*(.+)/', $line, $matches)) {
+                continue;
+            }
+
+            $rowData = $matches[1];
+            $cells = array_map('trim', explode('|', $rowData));
+
+            // Need at least POD and rates
+            if (count($cells) < 5) continue;
+
+            // Detect row structure based on content
+            // Full row: POD | Code | Country | USD | rate20 | rate40 | T/T | T/S | ETD_BKK | ETD_LCH
+            // Partial row (no country): POD | Code | USD | rate20 | rate40 | T/T | T/S | ETD_BKK | ETD_LCH
+            // Or: POD | City | USD | rate20 | rate40 | T/T | T/S | ETD_BKK | ETD_LCH
+
+            $pod = '';
+            $rate20 = '';
+            $rate40 = '';
+            $tt = '';
+            $ts = '';
+            $etdBkk = '';
+            $etdLch = '';
+
+            // Find USD position to determine structure
+            $usdPos = -1;
+            for ($i = 0; $i < count($cells); $i++) {
+                if (strtoupper(trim($cells[$i])) === 'USD') {
+                    $usdPos = $i;
+                    break;
+                }
+            }
+
+            if ($usdPos === -1) continue; // No USD found, skip
+
+            // POD is always the first cell
+            $pod = $cells[0];
+
+            // Rates are after USD
+            $rate20 = $cells[$usdPos + 1] ?? '';
+            $rate40 = $cells[$usdPos + 2] ?? '';
+
+            // T/T is after rates (position depends on structure)
+            // Check if cell after rate40 contains "Day" or is numeric (T/T)
+            $ttIndex = $usdPos + 3;
+            if (isset($cells[$ttIndex])) {
+                $potentialTt = $cells[$ttIndex];
+                // T/T values: "10 Days", "9 Days", "12-15 Days", etc.
+                if (preg_match('/\d+.*day|^\d+$|\d+-\d+/i', $potentialTt)) {
+                    $tt = $potentialTt;
+                    $ts = $cells[$ttIndex + 1] ?? '';
+                    $etdBkk = $cells[$ttIndex + 2] ?? '';
+                    $etdLch = $cells[$ttIndex + 3] ?? '';
+                } else {
+                    // It might be T/S if it's "Direct", "PUS", "NANSHA", etc.
+                    $ts = $potentialTt;
+                    $etdBkk = $cells[$ttIndex + 1] ?? '';
+                    $etdLch = $cells[$ttIndex + 2] ?? '';
+                }
+            }
+
+            // Clean POD - remove port codes in parentheses or after spaces
+            $pod = preg_replace('/\s*\([^)]+\)/', '', $pod); // Remove (CatLai) etc.
+
+            // Clean rates
+            $rate20Clean = preg_replace('/[^0-9]/', '', $rate20);
+            $rate40Clean = preg_replace('/[^0-9]/', '', $rate40);
+
+            // Skip invalid rows
+            if (empty($pod) || empty($rate20Clean)) continue;
+            if (preg_match('/^(destination|port|currency)/i', $pod)) continue;
+
+            // Format T/T
+            $ttFormatted = $tt;
+            if (!empty($tt) && !preg_match('/day/i', $tt)) {
+                $ttFormatted = $tt . ' Days';
+            }
+            if (empty($ttFormatted)) {
+                $ttFormatted = 'TBA';
+            }
+
+            // Format T/S
+            if (empty($ts)) {
+                $ts = 'Direct';
+            }
+
+            // Format ETD
+            $etdBkkFormatted = !empty($etdBkk) ? $etdBkk : '';
+            $etdLchFormatted = !empty($etdLch) ? $etdLch : '';
+
+            $rates[] = $this->createRateEntry('DONGJIN', 'BKK/LCH', strtoupper($pod), $rate20Clean, $rate40Clean, [
+                'T/T' => $ttFormatted,
+                'T/S' => $ts,
+                'ETD BKK' => $etdBkkFormatted,
+                'ETD LCH' => $etdLchFormatted,
+                'VALIDITY' => $validity,
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
      * Parse generic table format
      */
     protected function parseGenericTable(array $lines, string $pattern, string $validity): array
@@ -1626,6 +1761,16 @@ class RateExtractionService
             $endDay = $matches[2];
             $month = strtoupper($matches[3]);
             $year = $matches[4];
+
+            return strtoupper("{$startDay}-{$endDay} {$month} {$year}");
+        }
+
+        // Match patterns without year like "1-30 Nov" (use current year)
+        if (preg_match('/(\d{1,2})[-_\s]+(\d{1,2})[-_\s]*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/i', $filename, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper($matches[3]);
+            $year = date('Y');
 
             return strtoupper("{$startDay}-{$endDay} {$month} {$year}");
         }
