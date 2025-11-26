@@ -208,6 +208,36 @@ class AzureOcrService
             return $dateRange . ' ' . $month . ' ' . $year;
         }
 
+        // Pattern 3: "1-15 Nov 25" or "1 - 15 Nov. 25" (TS LINE format)
+        if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*[\'`]?(\d{2,4})/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = $matches[4];
+            if (strlen($year) == 2) {
+                $year = '20' . $year;
+            }
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 4: "RATE GUIDELINE FOR DECEMBER 1-31, 2025" (SM LINE format - month first)
+        if (preg_match('/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),?\s*(\d{4})/i', $content, $matches)) {
+            $monthFull = strtoupper($matches[1]);
+            $startDay = $matches[2];
+            $endDay = $matches[3];
+            $year = $matches[4];
+
+            // Convert full month name to 3-letter abbreviation
+            $monthMap = [
+                'JANUARY' => 'JAN', 'FEBRUARY' => 'FEB', 'MARCH' => 'MAR', 'APRIL' => 'APR',
+                'MAY' => 'MAY', 'JUNE' => 'JUN', 'JULY' => 'JUL', 'AUGUST' => 'AUG',
+                'SEPTEMBER' => 'SEP', 'OCTOBER' => 'OCT', 'NOVEMBER' => 'NOV', 'DECEMBER' => 'DEC'
+            ];
+            $month = $monthMap[$monthFull] ?? $monthFull;
+
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
         return '';
     }
 }

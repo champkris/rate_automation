@@ -43,8 +43,8 @@ class RateExtractionService
         $filename = basename($filePath);
         $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
 
-        // Auto-detect pattern from filename if set to 'auto'
-        if ($pattern === 'auto') {
+        // Auto-detect pattern from filename if empty or set to 'auto'
+        if ($pattern === '' || $pattern === 'auto') {
             $pattern = $this->detectPatternFromFilename($filename);
         }
 
@@ -83,6 +83,36 @@ class RateExtractionService
     }
 
     /**
+     * Detect pattern from OCR content (for PDFs where filename doesn't identify the carrier)
+     */
+    protected function detectPatternFromContent(array $lines): string
+    {
+        $content = implode("\n", array_slice($lines, 0, 30)); // Check first 30 lines
+
+        // SM LINE signature: "BANGKOK (UNITHAI)" and "LAEMCHABANG" in headers
+        if (preg_match('/BANGKOK.*UNITHAI/i', $content) && preg_match('/LAEMCHABANG/i', $content)) {
+            return 'sm_line';
+        }
+
+        // CK LINE signature: has ETD BKK and ETD LCH columns
+        if (preg_match('/ETD\s*BKK/i', $content) && preg_match('/ETD\s*LCH/i', $content)) {
+            return 'ck_line';
+        }
+
+        // TS LINE signature: "TS LINES" in content
+        if (preg_match('/TS\s*LINES?/i', $content)) {
+            return 'ts_line';
+        }
+
+        // DONGJIN signature
+        if (preg_match('/DONGJIN/i', $content)) {
+            return 'dongjin';
+        }
+
+        return 'generic';
+    }
+
+    /**
      * Extract from Excel file
      */
     protected function extractFromExcel(string $filePath, string $pattern, string $validity): array
@@ -113,16 +143,12 @@ class RateExtractionService
         $tableFile = $azureResultsDir . $baseFilename . '_tables.txt';
         $jsonFile = $azureResultsDir . $baseFilename . '_azure_result.json';
 
-        // Try to extract validity from filename first (e.g., "GUIDE RATE FOR 1-30 NOV 2025_SINOKOR")
-        if (empty($validity)) {
-            $validity = $this->extractValidityFromFilename($baseFilename);
-        }
-
         // Check for existing Azure OCR results first
         if (file_exists($tableFile)) {
             $content = file_get_contents($tableFile);
             $lines = explode("\n", $content);
 
+            // Extract validity from PDF content (JSON) first - has more detail (date range)
             if (empty($validity) && file_exists($jsonFile)) {
                 $validity = $this->extractValidityFromJson($jsonFile);
             }
@@ -140,7 +166,18 @@ class RateExtractionService
             // Extract tables to lines format
             $lines = $azureOcr->extractTablesToLines($azureResult);
 
-            // Extract validity from result
+            // Normalize lines - split any embedded newlines (Azure cell content may contain \n)
+            // This ensures fresh OCR and cached file read produce the same line structure
+            $normalizedLines = [];
+            foreach ($lines as $line) {
+                $subLines = explode("\n", $line);
+                foreach ($subLines as $subLine) {
+                    $normalizedLines[] = $subLine;
+                }
+            }
+            $lines = $normalizedLines;
+
+            // Extract validity from PDF content first - has more detail (date range)
             if (empty($validity)) {
                 $validity = $azureOcr->extractValidityFromResult($azureResult);
             }
@@ -153,6 +190,16 @@ class RateExtractionService
             file_put_contents($tableFile, implode("\n", $lines));
         }
 
+        // Fallback: extract validity from filename if not found in PDF content
+        if (empty($validity)) {
+            $validity = $this->extractValidityFromFilename($baseFilename);
+        }
+
+        // Content-based pattern detection if filename detection returned 'generic'
+        if ($pattern === 'generic') {
+            $pattern = $this->detectPatternFromContent($lines);
+        }
+
         return match ($pattern) {
             'sinokor' => $this->parseSinokorTable($lines, $validity),
             'sinokor_skr' => $this->parseSinokorSkrTable($lines, $validity),
@@ -162,6 +209,8 @@ class RateExtractionService
             'wanhai' => $this->parseWanhaiTable($lines, $validity),
             'ts_line' => $this->parseTsLineTable($lines, $validity),
             'dongjin' => $this->parseDongjinTable($lines, $validity),
+            'ck_line' => $this->parseCkLineTable($lines, $validity),
+            'sm_line' => $this->parseSmLineTable($lines, $validity),
             default => $this->parseGenericTable($lines, $pattern, $validity),
         };
     }
@@ -1484,6 +1533,303 @@ class RateExtractionService
     }
 
     /**
+     * Parse CK LINE table format (from Azure OCR)
+     * Structure: POD | Code | Country | USD | rate20 | rate40 | Validity | T/T | T/S | ETD BKK | ETD LCH
+     * Some rows have continuation lines with :unselected: containing ETD values
+     */
+    protected function parseCkLineTable(array $lines, string $validity): array
+    {
+        $rates = [];
+
+        // First pass: merge continuation lines with their parent rows
+        $mergedLines = [];
+        $currentRowLine = '';
+
+        foreach ($lines as $line) {
+            if (preg_match('/^Row \d+:/', $line)) {
+                if (!empty($currentRowLine)) {
+                    $mergedLines[] = $currentRowLine;
+                }
+                $currentRowLine = $line;
+            } elseif (preg_match('/^:unselected:|^:selected:/', $line)) {
+                // Continuation line - merge with current row
+                $continuation = preg_replace('/^:(un)?selected:\s*/', '', $line);
+                $continuation = trim($continuation);
+                if (!empty($continuation)) {
+                    $currentRowLine .= ' | ' . $continuation;
+                }
+            }
+        }
+        // Don't forget the last row
+        if (!empty($currentRowLine)) {
+            $mergedLines[] = $currentRowLine;
+        }
+
+        foreach ($mergedLines as $line) {
+            // Skip header row and table markers
+            if (preg_match('/^TABLE \d+|^-{10,}|^Row 0:|Destination port|Currency/i', $line)) {
+                continue;
+            }
+
+            // Match data rows
+            if (!preg_match('/^Row \d+:\s*(.+)/', $line, $matches)) {
+                continue;
+            }
+
+            $rowData = $matches[1];
+            $cells = array_map('trim', explode('|', $rowData));
+
+            // Need at least POD and rates
+            if (count($cells) < 5) continue;
+
+            // Find USD position to determine structure
+            $usdPos = -1;
+            for ($i = 0; $i < count($cells); $i++) {
+                if (strtoupper(trim($cells[$i])) === 'USD') {
+                    $usdPos = $i;
+                    break;
+                }
+            }
+
+            if ($usdPos === -1) continue;
+
+            // POD is always the first cell
+            $pod = $cells[0];
+
+            // Rates are after USD (format: "$60 (INC.LSS)" or "$1,200 (INC.LSS/DTHC)")
+            $rate20Raw = $cells[$usdPos + 1] ?? '';
+            $rate40Raw = $cells[$usdPos + 2] ?? '';
+
+            // Extract numeric rates (remove $ and commas, keep only numbers)
+            $rate20 = preg_replace('/[^0-9]/', '', $rate20Raw);
+            $rate40 = preg_replace('/[^0-9]/', '', $rate40Raw);
+
+            // Extract remark from rate (e.g., "INC.LSS" or "INC.LSS/DTHC")
+            $remark = '';
+            if (preg_match('/\(([^)]+)\)/', $rate20Raw, $remarkMatch)) {
+                $remark = trim($remarkMatch[1]);
+            } elseif (preg_match('/\(([^)]+)\)/', $rate40Raw, $remarkMatch)) {
+                $remark = trim($remarkMatch[1]);
+            }
+
+            // CK LINE structure after rates: Validity | T/T | T/S | ETD BKK | ETD LCH
+            // Note: Continuation lines may add empty cells, so we need to find ETD at end
+            $validityCell = $cells[$usdPos + 3] ?? '';
+            $tt = $cells[$usdPos + 4] ?? '';
+            $ts = $cells[$usdPos + 5] ?? '';
+
+            // ETD values - check if continuation added extra cells
+            // Standard: cells at usdPos+6 and usdPos+7
+            // With continuation: may have empty cell at usdPos+6, values at end
+            $etdBkk = '';
+            $etdLch = '';
+
+            $cellCount = count($cells);
+            $expectedEtdBkkPos = $usdPos + 6;
+
+            // If we have more cells than expected and cell at expected position is empty,
+            // look for ETD values at the end of the array
+            if ($cellCount > $expectedEtdBkkPos + 2 && empty(trim($cells[$expectedEtdBkkPos] ?? ''))) {
+                // ETD values are at the end (after empty continuation cell)
+                $etdLch = trim($cells[$cellCount - 1] ?? '');
+                $etdBkk = trim($cells[$cellCount - 2] ?? '');
+            } else {
+                // Standard position
+                $etdBkk = trim($cells[$expectedEtdBkkPos] ?? '');
+                $etdLch = trim($cells[$expectedEtdBkkPos + 1] ?? '');
+            }
+
+            // Clean POD - remove port codes in parentheses
+            $podClean = preg_replace('/\s*\([^)]+\)/', '', $pod);
+
+            // Skip invalid rows
+            if (empty($podClean) || empty($rate20)) continue;
+            if (preg_match('/^(destination|port|currency)/i', $podClean)) continue;
+
+            // Use validity from cell if main validity is empty
+            if (empty($validity) && !empty($validityCell)) {
+                // Format: "01-30/11/25" -> "01-30 NOV 2025"
+                if (preg_match('/(\d{1,2}-\d{1,2})\/(\d{1,2})\/(\d{2})/', $validityCell, $vMatches)) {
+                    $monthNames = ['01' => 'JAN', '02' => 'FEB', '03' => 'MAR', '04' => 'APR',
+                                   '05' => 'MAY', '06' => 'JUN', '07' => 'JUL', '08' => 'AUG',
+                                   '09' => 'SEP', '10' => 'OCT', '11' => 'NOV', '12' => 'DEC'];
+                    $monthNum = str_pad($vMatches[2], 2, '0', STR_PAD_LEFT);
+                    $monthName = $monthNames[$monthNum] ?? 'JAN';
+                    $year = '20' . $vMatches[3];
+                    $validity = $vMatches[1] . ' ' . $monthName . ' ' . $year;
+                }
+            }
+
+            // Format T/T
+            $ttFormatted = $tt;
+            if (!empty($tt) && !preg_match('/day/i', $tt)) {
+                $ttFormatted = $tt . ' Days';
+            }
+            if (empty($ttFormatted) || $ttFormatted === '-') {
+                $ttFormatted = 'TBA';
+            }
+
+            // Format T/S
+            if (empty($ts)) {
+                $ts = 'Direct';
+            }
+
+            $rates[] = $this->createRateEntry('CK LINE', 'BKK/LCH', strtoupper($podClean), $rate20, $rate40, [
+                'T/T' => $ttFormatted,
+                'T/S' => $ts,
+                'ETD BKK' => $etdBkk,
+                'ETD LCH' => $etdLch,
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse SM LINE table format (from Azure OCR)
+     * Structure: COUNTRY | POD | BKK 20' | BKK 40' | LCH 20' | LCH 40' | REMARK | FREE TIME
+     * POD may have (REEFER) suffix - these go to 20 RF/40RF columns
+     * Columns 1-2 are BKK rates, columns 3-4 are LCH rates (different POL entries)
+     */
+    protected function parseSmLineTable(array $lines, string $validity): array
+    {
+        $rates = [];
+
+        foreach ($lines as $line) {
+            // Skip headers and non-data rows
+            if (preg_match('/^TABLE \d+|^-{10,}|^Row [01]:|COUNTRY|POD.*DESTINATION|OUTBOUND|INBOUND|THC|B\/L|SEAL|CFS|D\/O|Container|DEPOSIT|CLEANING/i', $line)) {
+                continue;
+            }
+
+            // Match data rows (Row 2 onwards for rate data)
+            if (!preg_match('/^Row \d+:\s*(.+)/', $line, $matches)) {
+                continue;
+            }
+
+            $rowData = $matches[1];
+            $cells = array_map('trim', explode('|', $rowData));
+
+            // Need at least 5 cells for valid rate row
+            if (count($cells) < 5) continue;
+
+            // Find POD - it's the first cell that looks like a destination name
+            $pod = '';
+            $rateStartIndex = 0;
+
+            for ($i = 0; $i < min(3, count($cells)); $i++) {
+                $cell = $cells[$i];
+                // POD should be a name containing letters, not just N/A, not empty, not a country
+                if (!empty($cell) &&
+                    preg_match('/[A-Z]/i', $cell) &&
+                    !preg_match('/^(N\/A|VIETNAM|KOREA|CHINA|JAPAN|TAIWAN|HONG KONG)$/i', $cell)) {
+                    $pod = $cell;
+                    $rateStartIndex = $i + 1;
+                    break;
+                }
+            }
+
+            // Skip if POD is empty or looks like header
+            if (empty($pod) || preg_match('/^(20|40|CHARGE)/i', $pod)) continue;
+
+            // For SM LINE, rates may have N/A which shifts positions
+            // Collect all $ values and N/A markers
+            $rateValues = [];
+            $remarkFreeTime = [];
+
+            for ($i = $rateStartIndex; $i < count($cells); $i++) {
+                $cell = $cells[$i];
+                if (preg_match('/^\$?\d+|^N\/A$/i', $cell)) {
+                    $rateValues[] = $cell;
+                } elseif (!empty($cell) && !preg_match('/^\s*$/', $cell)) {
+                    $remarkFreeTime[] = $cell;
+                }
+            }
+
+            // We expect 4 rate values: BKK 20', BKK 40', LCH 20', LCH 40'
+            $bkk20 = $rateValues[0] ?? '';
+            $bkk40 = $rateValues[1] ?? '';
+            $lch20 = $rateValues[2] ?? '';
+            $lch40 = $rateValues[3] ?? '';
+
+            // Remark and Free Time are non-rate text at the end
+            $remark = $remarkFreeTime[0] ?? '';
+            $freeTime = $remarkFreeTime[1] ?? '';
+
+            // Clean up rates - extract numeric values
+            $bkk20Clean = preg_replace('/[^0-9]/', '', $bkk20);
+            $bkk40Clean = preg_replace('/[^0-9]/', '', $bkk40);
+            $lch20Clean = preg_replace('/[^0-9]/', '', $lch20);
+            $lch40Clean = preg_replace('/[^0-9]/', '', $lch40);
+
+            // Determine if this is a REEFER rate (from POD name)
+            $isReefer = preg_match('/REEFER/i', $pod);
+            $podClean = preg_replace('/\s*\(REEFER\)\s*/i', '', $pod);
+            $podClean = trim($podClean);
+
+            // Check if rates are valid (not N/A)
+            $hasBkkRates = !empty($bkk20Clean) || !empty($bkk40Clean);
+            $hasLchRates = !empty($lch20Clean) || !empty($lch40Clean);
+            $bkkIsNA = strtoupper($bkk20) === 'N/A' || (empty($bkk20) && strtoupper($bkk40) === 'N/A');
+
+            // Create BKK entry (if not N/A)
+            if ($hasBkkRates && !$bkkIsNA) {
+                $rate20 = !empty($bkk20Clean) ? $bkk20Clean : '';
+                $rate40 = !empty($bkk40Clean) ? $bkk40Clean : '';
+
+                $entry = $this->createRateEntry('SM LINE', 'BKK', strtoupper($podClean),
+                    $isReefer ? '' : $rate20,
+                    $isReefer ? '' : $rate40,
+                    [
+                        'FREE TIME' => $freeTime,
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'REMARK' => $remark,
+                    ]);
+
+                // If REEFER, put rates in RF columns instead
+                if ($isReefer) {
+                    $entry['20 RF'] = $rate20;
+                    $entry['40RF'] = $rate40;
+                }
+
+                $rates[] = $entry;
+            }
+
+            // Create LCH entry
+            // For REEFER: always create both BKK and LCH entries
+            // For non-REEFER: create LCH if has rates AND (BKK is N/A OR LCH rates are different from BKK)
+            $shouldCreateLch = $isReefer
+                ? $hasLchRates
+                : ($hasLchRates && ($bkkIsNA || $lch20Clean !== $bkk20Clean || $lch40Clean !== $bkk40Clean));
+
+            if ($shouldCreateLch) {
+                $rate20 = !empty($lch20Clean) ? $lch20Clean : '';
+                $rate40 = !empty($lch40Clean) ? $lch40Clean : '';
+
+                $entry = $this->createRateEntry('SM LINE', 'LCH', strtoupper($podClean),
+                    $isReefer ? '' : $rate20,
+                    $isReefer ? '' : $rate40,
+                    [
+                        'FREE TIME' => $freeTime,
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'REMARK' => $remark,
+                    ]);
+
+                // If REEFER, put rates in RF columns instead
+                if ($isReefer) {
+                    $entry['20 RF'] = $rate20;
+                    $entry['40RF'] = $rate40;
+                }
+
+                $rates[] = $entry;
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
      * Parse generic table format
      */
     protected function parseGenericTable(array $lines, string $pattern, string $validity): array
@@ -1775,6 +2121,23 @@ class RateExtractionService
             return strtoupper("{$startDay}-{$endDay} {$month} {$year}");
         }
 
+        // Match month and year only patterns like "DECEMBER 2025", "NOV 2025", "of NOVEMBER 2025"
+        // This handles "Rate Guideline of DECEMBER 2025" format
+        if (preg_match('/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-_\s]*(\d{4})/i', $filename, $matches)) {
+            $monthFull = strtoupper($matches[1]);
+            $year = $matches[2];
+
+            // Convert full month name to 3-letter abbreviation
+            $monthMap = [
+                'JANUARY' => 'JAN', 'FEBRUARY' => 'FEB', 'MARCH' => 'MAR', 'APRIL' => 'APR',
+                'MAY' => 'MAY', 'JUNE' => 'JUN', 'JULY' => 'JUL', 'AUGUST' => 'AUG',
+                'SEPTEMBER' => 'SEP', 'OCTOBER' => 'OCT', 'NOVEMBER' => 'NOV', 'DECEMBER' => 'DEC'
+            ];
+            $month = $monthMap[$monthFull] ?? $monthFull;
+
+            return strtoupper("{$month} {$year}");
+        }
+
         // Return empty to allow fallback to other methods
         return '';
     }
@@ -1825,6 +2188,25 @@ class RateExtractionService
             if (strlen($year) == 2) {
                 $year = '20' . $year;
             }
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 4: "RATE GUIDELINE FOR DECEMBER 1-31, 2025" (SM LINE format - month first)
+        // Also matches "FOR NOVEMBER 1-30, 2025", etc.
+        if (preg_match('/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),?\s*(\d{4})/i', $content, $matches)) {
+            $monthFull = strtoupper($matches[1]);
+            $startDay = $matches[2];
+            $endDay = $matches[3];
+            $year = $matches[4];
+
+            // Convert full month name to 3-letter abbreviation
+            $monthMap = [
+                'JANUARY' => 'JAN', 'FEBRUARY' => 'FEB', 'MARCH' => 'MAR', 'APRIL' => 'APR',
+                'MAY' => 'MAY', 'JUNE' => 'JUN', 'JULY' => 'JUL', 'AUGUST' => 'AUG',
+                'SEPTEMBER' => 'SEP', 'OCTOBER' => 'OCT', 'NOVEMBER' => 'NOV', 'DECEMBER' => 'DEC'
+            ];
+            $month = $monthMap[$monthFull] ?? $monthFull;
+
             return "{$startDay}-{$endDay} {$month} {$year}";
         }
 
