@@ -69,6 +69,9 @@ class RateExtractionService
         if (preg_match('/UPDATED.?RATE/i', $filename)) return 'kmtc';
         // Check SKR pattern before generic SINOKOR (SKR is the HK feederage table)
         if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) return 'sinokor_skr';
+        // "GUIDE RATE FOR" with "(SKR)" or "_SKR_" is regular SINOKOR format (not feederage)
+        // Note: parentheses may be sanitized to underscores in uploaded filenames
+        if (preg_match('/GUIDE.?RATE.*[\(_]SKR[\)_]/i', $filename)) return 'sinokor';
         if (preg_match('/SINOKOR/i', $filename)) return 'sinokor';
         if (preg_match('/HEUNG.?A|HUANG.?A/i', $filename)) return 'heung_a';
         if (preg_match('/BOXMAN/i', $filename)) return 'boxman';
@@ -497,13 +500,20 @@ class RateExtractionService
             $country = '';
 
             if (count($cells) >= 4) {
-                // 4 columns: COUNTRY | POD | 20' | 40'
+                // 4 columns: COUNTRY | POD | 20' | 40' OR COUNTRY | POD | MERGED_RATES | REMARK
                 $country = trim($cells[0] ?? '');
                 $pod = trim($cells[1] ?? '');
                 $rate20 = trim($cells[2] ?? '');
                 $rate40 = trim($cells[3] ?? '');
+
+                // Check if rate20 contains merged rates like "30 60" or "250 500"
+                if (preg_match('/^(\d+)\s+(\d+)$/', $rate20, $mergedMatch)) {
+                    $rate20 = $mergedMatch[1];
+                    $rate40 = $mergedMatch[2];
+                }
             } elseif (count($cells) == 3) {
                 // Could be: POD | 20' | 40' (continuation) OR COUNTRY | POD | REMARK (header row)
+                // OR: POD | MERGED_RATES | REMARK (continuation with merged rates)
                 $cell0 = trim($cells[0] ?? '');
                 $cell1 = trim($cells[1] ?? '');
                 $cell2 = trim($cells[2] ?? '');
@@ -511,19 +521,34 @@ class RateExtractionService
                 // Check if this is a country header row (3rd column is not numeric, contains text)
                 // e.g., "S.CHINA | S.CHINA T/S HKG | SELL AT PRD SALES GUIDE"
                 if (!preg_match('/^\d+$/', $cell2) && preg_match('/[A-Za-z]{3,}/', $cell2)) {
-                    // This is a country header row
-                    $country = $cell0;
-                    $pod = $cell1;
-                    $rate20 = $cell2; // Will be skipped by SELL/GUIDE check below
-                    $rate40 = '';
+                    // Check if cell1 contains merged rates like "30 60"
+                    if (preg_match('/^(\d+)\s+(\d+)$/', $cell1, $mergedMatch)) {
+                        // POD | MERGED_RATES | REMARK format
+                        $pod = $cell0;
+                        $rate20 = $mergedMatch[1];
+                        $rate40 = $mergedMatch[2];
+                    } else {
+                        // This is a country header row
+                        $country = $cell0;
+                        $pod = $cell1;
+                        $rate20 = $cell2; // Will be skipped by SELL/GUIDE check below
+                        $rate40 = '';
+                    }
                 } else {
                     // Standard continuation row: POD | 20' | 40'
                     $pod = $cell0;
                     $rate20 = $cell1;
                     $rate40 = $cell2;
+
+                    // Check if rate20 contains merged rates like "30 60"
+                    if (preg_match('/^(\d+)\s+(\d+)$/', $rate20, $mergedMatch)) {
+                        $rate20 = $mergedMatch[1];
+                        $rate40 = $mergedMatch[2];
+                    }
                 }
             } elseif (count($cells) == 2) {
                 // 2 columns: could be "POD | --------" or rates for pending POD
+                // OR: POD | MERGED_RATES (continuation with merged rates like "TOKYO | 250 500")
                 $firstCell = trim($cells[0] ?? '');
                 $secondCell = trim($cells[1] ?? '');
 
@@ -533,8 +558,15 @@ class RateExtractionService
                     continue;
                 }
 
-                // Otherwise it might be rates for pending POD
-                if (!empty($pendingPod)) {
+                // Check if second cell contains merged rates like "250 500"
+                if (preg_match('/^(\d+)\s+(\d+)$/', $secondCell, $mergedMatch)) {
+                    // This is POD | MERGED_RATES format
+                    $pod = $firstCell;
+                    $rate20 = $mergedMatch[1];
+                    $rate40 = $mergedMatch[2];
+                    // Don't continue - let it fall through to rate entry creation
+                } elseif (!empty($pendingPod)) {
+                    // Otherwise it might be rates for pending POD
                     $rate20 = preg_replace('/[^0-9]/', '', $firstCell);
                     $rate40 = preg_replace('/[^0-9]/', '', $secondCell);
                     if (!empty($rate20) || !empty($rate40)) {
@@ -545,8 +577,10 @@ class RateExtractionService
                         ]);
                     }
                     $pendingPod = '';
+                    continue;
+                } else {
+                    continue;
                 }
-                continue;
             }
 
             // Update current country if we got a new one (do this BEFORE any skip checks)
@@ -1082,34 +1116,694 @@ class RateExtractionService
 
     /**
      * Parse Wanhai/India table format
+     * Structure: Port of Loading | Nation | Destination | Port code | 20' rate | 40' rate
+     * POL codes: THBKK, THLCB, THLCH, THLKA (or combinations like "THBKK THLCB")
+     * Output: BKK/LCB if both have rates, individual POL otherwise
      */
     protected function parseWanhaiTable(array $lines, string $validity): array
     {
-        $rates = [];
+        // Detect if this is INDIA format by checking for LKA/LCB header pattern
+        $isIndiaFormat = false;
+        // Detect if this is MIDDLE EAST format: POL | POD (combined code+name) | 20GP | 40HQ | ...
+        $isMiddleEastFormat = false;
+        foreach ($lines as $line) {
+            if (preg_match('/Row [01]:.*LKA.*LCB/i', $line) || preg_match('/Row 2:.*POD.*20.*40.*20RF.*40R/i', $line)) {
+                $isIndiaFormat = true;
+                break;
+            }
+            // Middle East format has POD header and WBS/WRS columns
+            if (preg_match('/Row 1:.*POL.*POD.*DRY.*RF.*WBS/i', $line)) {
+                $isMiddleEastFormat = true;
+                break;
+            }
+        }
+
+        if ($isIndiaFormat) {
+            return $this->parseWanhaiIndiaTable($lines, $validity);
+        }
+
+        if ($isMiddleEastFormat) {
+            return $this->parseWanhaiMiddleEastTable($lines, $validity);
+        }
+
+        $rawRates = []; // Collect rates by destination+POL first
+        $currentDestination = '';
+        $currentPortCode = '';
+        $lastPolCodes = ['THLCB']; // Default POL
+
+        // POL code mapping to standardized names
+        $polMapping = [
+            'THBKK' => 'BKK',
+            'THLCB' => 'LCB',
+            'THLCH' => 'LCH',
+            'THLKA' => 'LKA',
+        ];
+
+        // Nation codes (2-letter country codes) - not destinations
+        $nationCodes = ['JP', 'HK', 'PH', 'TW', 'KR', 'VN', 'MY', 'SG', 'ID', 'CN'];
 
         foreach ($lines as $line) {
-            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+            if (!preg_match('/^Row (\d+): (.+)$/', $line, $matches)) continue;
 
-            $cells = explode(' | ', $matches[1]);
-            if (count($cells) < 4) continue;
-            if (preg_match('/(POD|LKA|LCB|RATE)/i', $cells[0])) continue;
+            $rowNum = intval($matches[1]);
+            $rowContent = $matches[2];
 
-            $pod = trim($cells[0] ?? '');
-            $rate20 = trim($cells[3] ?? $cells[1] ?? '');
-            $rate40 = trim($cells[4] ?? $cells[2] ?? '');
+            // Skip header rows
+            if ($rowNum <= 1) continue;
+            if (preg_match('/(Port of Loading|Nation|Destination|Port code|20SD|40.*HQ)/i', $rowContent)) continue;
 
-            $pod = preg_replace('/\s*\([^)]+\)/', '', $pod);
+            $cells = explode(' | ', $rowContent);
+            if (count($cells) < 2) continue;
+
+            // Get first cell (POL or continuation)
+            $firstCell = trim($cells[0] ?? '');
+
+            // Check if this is a POL code or continuation
+            $polCodes = [];
+            $hasPolCode = false;
+
+            // Pattern to match POL codes: THBKK, THLCB, THLCH, THLKA or combinations
+            if (preg_match('/\b(THBKK|THLCB|THLCH|THLKA)\b/', $firstCell)) {
+                $hasPolCode = true;
+                // Extract all POL codes from the cell (handle merged like "THBKK THLCB" or "THBKK-THLCB")
+                if (preg_match_all('/\b(THBKK|THLCB|THLCH|THLKA)\b/', $firstCell, $polMatches)) {
+                    $polCodes = array_unique($polMatches[1]);
+                    $lastPolCodes = $polCodes; // Remember for continuation rows
+                }
+            }
+
+            // Determine structure based on cell count
+            $destination = '';
+            $portCode = '';
+            $rate20 = '';
+            $rate40 = '';
+
+            if ($hasPolCode) {
+                // This row has POL code(s)
+                if (count($cells) >= 6) {
+                    // Full row: POL | Nation | Destination | Port code | 20' | 40'
+                    $cell1 = trim($cells[1] ?? '');
+                    $cell2 = trim($cells[2] ?? '');
+                    $cell3 = trim($cells[3] ?? '');
+                    $cell4 = trim($cells[4] ?? '');
+                    $cell5 = trim($cells[5] ?? '');
+
+                    // Check if cell1 is nation code
+                    if (in_array($cell1, $nationCodes) || empty($cell1)) {
+                        // Standard: POL | Nation | Destination | Port code | 20' | 40'
+                        $destination = $cell2;
+                        $portCode = $cell3;
+                        $rate20 = $cell4;
+                        $rate40 = $cell5;
+                    } else {
+                        // Alternative: POL | Destination | Port code | 20' | 40' | extra
+                        $destination = $cell1;
+                        $portCode = $cell2;
+                        $rate20 = $cell3;
+                        $rate40 = $cell4;
+                    }
+                } elseif (count($cells) >= 4) {
+                    $secondCell = trim($cells[1] ?? '');
+                    $thirdCell = trim($cells[2] ?? '');
+                    $fourthCell = trim($cells[3] ?? '');
+
+                    if (empty($secondCell) && preg_match('/^\d+$/', $thirdCell)) {
+                        // Pattern: POL | empty | 20' | 40' (continuation for same destination)
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $thirdCell;
+                        $rate40 = $fourthCell;
+                    } elseif (preg_match('/^\d+$/', $secondCell)) {
+                        // Pattern: POL | 20' | 40'
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $secondCell;
+                        $rate40 = $thirdCell;
+                    } elseif (preg_match('/^[A-Z]{2}[A-Z]{3}$/', $thirdCell)) {
+                        // Pattern: POL | Destination | Port code | 20' | 40'
+                        // Port codes are 5-letter codes (2-letter country + 3-letter port)
+                        // Examples: MXZLO, COBUN, ECGYE, JPKOB, etc.
+                        $destination = $secondCell;
+                        $portCode = $thirdCell;
+                        $rate20 = $fourthCell;
+                        $rate40 = trim($cells[4] ?? '');
+                    }
+                } elseif (count($cells) >= 3) {
+                    $secondCell = trim($cells[1] ?? '');
+                    $thirdCell = trim($cells[2] ?? '');
+
+                    if (preg_match('/^\d+$/', $secondCell)) {
+                        // Pattern: POL | 20' | 40'
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $secondCell;
+                        $rate40 = $thirdCell;
+                    }
+                }
+            } else {
+                // No POL code - continuation row
+                // Use last known POL codes
+                $polCodes = $lastPolCodes;
+
+                if (count($cells) >= 4) {
+                    $secondCell = trim($cells[1] ?? '');
+                    $thirdCell = trim($cells[2] ?? '');
+                    $fourthCell = trim($cells[3] ?? '');
+
+                    if (preg_match('/^[A-Z]{2}[A-Z]{3}$/', $secondCell)) {
+                        // Pattern: Destination | Port code | 20' | 40'
+                        // Port codes are 5-letter codes (2-letter country + 3-letter port)
+                        $destination = $firstCell;
+                        $portCode = $secondCell;
+                        $rate20 = $thirdCell;
+                        $rate40 = $fourthCell;
+                    } elseif (preg_match('/^[A-Z]{2}[A-Z]{3}$/', $thirdCell)) {
+                        // Pattern: Country/empty | Destination | Port code | 20' | 40'
+                        // e.g., "SG | SINGAPORE | SGSIN | 220 | 320" or " | PENANG | MYPEN | 230 | 300"
+                        $destination = $secondCell;
+                        $portCode = $thirdCell;
+                        $rate20 = $fourthCell;
+                        $rate40 = trim($cells[4] ?? '');
+                    }
+                } elseif (count($cells) >= 2) {
+                    // Pattern: 20' | 40' (just rates)
+                    if (preg_match('/^\d+$/', $firstCell)) {
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $firstCell;
+                        $rate40 = trim($cells[1] ?? '');
+                    }
+                }
+            }
+
+            // Clean up rates (remove non-numeric characters)
             $rate20 = preg_replace('/[^0-9]/', '', $rate20);
             $rate40 = preg_replace('/[^0-9]/', '', $rate40);
 
-            if (!empty($pod) && (!empty($rate20) || !empty($rate40))) {
-                $rates[] = $this->createRateEntry('WANHAI', 'BKK/LCH', $pod, $rate20, $rate40, [
+            // Update current destination/port for continuation rows
+            if (!empty($destination)) {
+                // Keep REEFER in destination name, but remove RUBBER WOOD
+                $cleanDestination = preg_replace('/\s*RUBBER\s*WOOD\s*/i', '', $destination);
+                $cleanDestination = trim($cleanDestination);
+                // Don't update if it's a nation code, UN/LOCODE port code (5-letter code), or number
+                $isPortCode = preg_match('/^[A-Z]{2}[A-Z]{3}$/', $cleanDestination);
+                if (!empty($cleanDestination)
+                    && !in_array($cleanDestination, $nationCodes)
+                    && !$isPortCode
+                    && !preg_match('/^\d+$/', $cleanDestination)) {
+                    $currentDestination = $cleanDestination;
+                }
+            }
+            // Port code must be a 5-letter code (2-letter country + 3-letter port)
+            if (!empty($portCode) && preg_match('/^[A-Z]{2}[A-Z]{3}$/', $portCode)) {
+                $currentPortCode = $portCode;
+            }
+
+            // Skip rows without rates
+            if (empty($rate20) && empty($rate40)) continue;
+
+            // Skip if no destination
+            if (empty($currentDestination)) continue;
+
+            // Use extracted POL codes or fall back to last known
+            if (empty($polCodes)) {
+                $polCodes = $lastPolCodes;
+            }
+
+            // Collect rates by destination and POL
+            foreach ($polCodes as $polCode) {
+                $pol = $polMapping[$polCode] ?? $polCode;
+                $key = $currentDestination . '|' . $rate20 . '|' . $rate40;
+
+                if (!isset($rawRates[$key])) {
+                    $rawRates[$key] = [
+                        'destination' => $currentDestination,
+                        'rate20' => $rate20,
+                        'rate40' => $rate40,
+                        'portCode' => $currentPortCode,
+                        'pols' => [],
+                    ];
+                }
+                if (!in_array($pol, $rawRates[$key]['pols'])) {
+                    $rawRates[$key]['pols'][] = $pol;
+                }
+            }
+        }
+
+        // Now consolidate rates: BKK/LCB if both have same rates, individual otherwise
+        $rates = [];
+        foreach ($rawRates as $data) {
+            $pols = $data['pols'];
+            sort($pols);
+
+            // Check if both BKK and LCB have the same rate
+            $hasBkk = in_array('BKK', $pols);
+            $hasLcb = in_array('LCB', $pols);
+
+            if ($hasBkk && $hasLcb) {
+                // Both BKK and LCB - use combined POL
+                $pol = 'BKK/LCB';
+                $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], [
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'PORT_CODE' => $data['portCode'],
                 ]);
+                // Also add other POLs (LCH, LKA) separately if present
+                foreach ($pols as $otherPol) {
+                    if ($otherPol !== 'BKK' && $otherPol !== 'LCB') {
+                        $rates[] = $this->createRateEntry('WANHAI', $otherPol, $data['destination'], $data['rate20'], $data['rate40'], [
+                            'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                            'PORT_CODE' => $data['portCode'],
+                        ]);
+                    }
+                }
+            } else {
+                // Individual POLs
+                foreach ($pols as $pol) {
+                    $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], [
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'PORT_CODE' => $data['portCode'],
+                    ]);
+                }
             }
         }
 
         return $rates;
+    }
+
+    /**
+     * Parse WANHAI Middle East rate table format (from Azure OCR)
+     * Structure: POL | POD (port code + name) | 20GP | 40HQ | 20RF | 40RH | WBS | WRS
+     * Example: THBKK/LCH | AEJEA ( JEBEL ALI ) | 1200 | 1450 | ... | INCL | 55/110
+     */
+    protected function parseWanhaiMiddleEastTable(array $lines, string $validity): array
+    {
+        $rates = [];
+
+        // Extract validity from header if not provided
+        if (empty($validity)) {
+            foreach ($lines as $line) {
+                // Pattern 1: "VALID 1-15 DEC" (no year - Middle East format)
+                if (preg_match('/VALID\s+(\d{1,2}[-–]\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/i', $line, $matches)) {
+                    $validity = $matches[1] . ' ' . strtoupper($matches[2]) . ' ' . date('Y');
+                    break;
+                }
+                // Pattern 2: Just "VALID 1-15 DEC" at end of line
+                if (preg_match('/Row 0:\s*VALID\s+(\d{1,2}[-–]\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)?/i', $line, $matches)) {
+                    $dateRange = $matches[1];
+                    $month = isset($matches[2]) ? strtoupper($matches[2]) : '';
+                    if (empty($month)) {
+                        // No month in Row 0, check if month is in filename or guess from context
+                        // For DEC files, assume DEC
+                        $month = 'DEC';
+                    }
+                    $validity = $dateRange . ' ' . $month . ' ' . date('Y');
+                    break;
+                }
+            }
+        }
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row (\d+): (.+)$/', $line, $matches)) continue;
+
+            $rowNum = intval($matches[1]);
+            $rowContent = $matches[2];
+
+            // Skip header rows (Row 0, 1, 2)
+            if ($rowNum <= 2) continue;
+            // Skip empty rows
+            if (preg_match('/^Row \d+:\s*$/', $line)) continue;
+
+            $cells = explode(' | ', $rowContent);
+            if (count($cells) < 4) continue;
+
+            $firstCell = trim($cells[0] ?? '');
+            $secondCell = trim($cells[1] ?? '');
+            $thirdCell = trim($cells[2] ?? '');
+            $fourthCell = trim($cells[3] ?? '');
+
+            // Skip rows with X or :unselected: in rate positions (no rate available)
+            if (preg_match('/^X$/i', $thirdCell) || preg_match('/^:selected:$/i', $thirdCell)) continue;
+
+            // Extract POL from first cell (format: THBKK/LCH)
+            // If multiple POLs (e.g., "THBKK/LCH"), extract just the first one for simplicity
+            // The slash format means rate applies to both, so we use BKK/LCH as combined POL
+            $pol = 'BKK';
+            if (preg_match('/TH(BKK).*\/(LCH|LCB)/i', $firstCell, $polMatch)) {
+                // Combined format: BKK/LCH
+                $pol = strtoupper($polMatch[1]) . '/' . strtoupper($polMatch[2]);
+            } elseif (preg_match('/TH(BKK|LCB|LCH|LKA)/i', $firstCell, $polMatch)) {
+                $pol = strtoupper($polMatch[1]);
+            }
+
+            // Extract POD - format: "AEJEA ( JEBEL ALI )" or "AEJEA (JEBEL ALI)"
+            // Port code is first, then destination name in parentheses
+            $destination = '';
+            $portCode = '';
+
+            if (preg_match('/^([A-Z]{5})\s*\(\s*(.+?)\s*\)/', $secondCell, $podMatch)) {
+                $portCode = $podMatch[1];
+                $destination = trim($podMatch[2]);
+            } elseif (preg_match('/^([A-Z]{5})\s+(.+)/', $secondCell, $podMatch)) {
+                // Alternative format: "AEJEA JEBEL ALI" without parentheses
+                $portCode = $podMatch[1];
+                $destination = trim($podMatch[2]);
+            } else {
+                // Just use the whole cell as destination
+                $destination = $secondCell;
+            }
+
+            // Skip if no destination
+            if (empty($destination)) continue;
+
+            // Get rates - 20GP is cell 2 (index 2), 40HQ is cell 3 (index 3)
+            $rate20 = preg_replace('/[^0-9]/', '', $thirdCell);
+            $rate40 = preg_replace('/[^0-9]/', '', $fourthCell);
+
+            // Skip rows without rates
+            if (empty($rate20) && empty($rate40)) continue;
+
+            // Build the POD display - include port code prefix
+            $podDisplay = $destination;
+            if (!empty($portCode)) {
+                $podDisplay = $portCode . ' (' . $destination . ')';
+            }
+
+            $rates[] = [
+                'CARRIER' => 'WANHAI',
+                'POL' => $pol,
+                'POD' => $podDisplay,
+                "20'" => $rate20,
+                "40'" => $rate40,
+                'VALIDITY' => $validity,
+            ];
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse WANHAI India rate table format (from Azure OCR)
+     * Structure: POD | LKA 20 | LKA 40HQ | LCB 20 | LCB 40HQ | 20RF | 40RH
+     * Both DRY and REEFER rates in same row
+     */
+    protected function parseWanhaiIndiaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $currentTable = 1;
+
+        // Extract validity from header if not provided
+        if (empty($validity)) {
+            foreach ($lines as $line) {
+                if (preg_match('/RATE\s+(\d{1,2}[-–]\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/i', $line, $matches)) {
+                    $validity = $matches[1] . ' ' . strtoupper($matches[2]) . ' ' . date('Y');
+                    break;
+                }
+            }
+            if (empty($validity)) {
+                $validity = strtoupper(date('M Y'));
+            }
+        }
+
+        foreach ($lines as $line) {
+            // Track which table we're in
+            if (preg_match('/^TABLE (\d+)/', $line, $tableMatch)) {
+                $currentTable = intval($tableMatch[1]);
+                continue;
+            }
+
+            // Skip non-data rows
+            if (!preg_match('/^Row (\d+):\s*(.+)/', $line, $matches)) continue;
+
+            $rowNum = intval($matches[1]);
+            $rowContent = $matches[2];
+
+            // For TABLE 1: Skip header rows (0, 1, 2)
+            // For TABLE 2: Skip row 0 (empty header), process rows 1-2
+            if ($currentTable == 1 && $rowNum <= 2) continue;
+            if ($currentTable == 2 && $rowNum == 0) continue;
+            if (preg_match('/^\s*$/', $rowContent)) continue;
+
+            $cells = array_map('trim', explode('|', $rowContent));
+
+            // Need at least POD + some rates
+            if (count($cells) < 3) continue;
+
+            // First cell is POD (e.g., "INNSA (NHAVA SHEVA)")
+            $pod = trim($cells[0]);
+
+            // Skip if POD is empty or looks like header/continuation
+            if (empty($pod) || preg_match('/^:?(selected|unselected):/i', $pod)) continue;
+            if (preg_match('/^(X|\s*)$/i', $pod)) continue;
+
+            // Clean POD - extract port code and name
+            // Format: "INNSA (NHAVA SHEVA)" -> "NHAVA SHEVA"
+            // Format: "INDEL/INDRI/INGGN..." -> clean up ICD codes
+            $podClean = $pod;
+            if (preg_match('/^[A-Z]{5}\s*\((.+)\)$/i', $pod, $podMatch)) {
+                $podClean = trim($podMatch[1]);
+            } elseif (preg_match('/^[A-Z]{5}\s+(.+)$/i', $pod, $podMatch)) {
+                $podClean = trim($podMatch[1]);
+            } elseif (preg_match('/^[A-Z]{5}\//', $pod)) {
+                // ICD codes like "INDEL/INDRI/INGGN..." - keep as is but clean up
+                $podClean = $pod;
+            }
+
+            // TABLE 2 has different structure - columns may be shifted
+            // Row 1: POD | empty | LKA 40 | LCB 20 | empty | empty
+            // Row 2: POD | LKA 20 | LKA 40 | (rest may be missing)
+            $lka20 = '';
+            $lka40 = '';
+            $lcb20 = '';
+            $lcb40 = '';
+            $rf20 = '';
+            $rf40 = '';
+
+            if ($currentTable == 2) {
+                // TABLE 2 is for Delhi/Ahmedabad ICDs via Mundra
+                // Rows 1-2 describe the same destination, combine into one POD
+                // Skip individual rows, handle as special case below
+                continue;
+            } else {
+                // TABLE 1: Standard structure POD | LKA 20 | LKA 40 | LCB 20 | LCB 40 | 20RF | 40RF
+                $lka20 = $cells[1] ?? '';
+                $lka40 = $cells[2] ?? '';
+                $lcb20 = $cells[3] ?? '';
+                $lcb40 = $cells[4] ?? '';
+                $rf20 = $cells[5] ?? '';
+                $rf40 = $cells[6] ?? '';
+            }
+
+            // Skip if all rates are X or empty
+            if (preg_match('/^X$/i', trim($lka20)) && preg_match('/^X$/i', trim($lcb20))) {
+                continue;
+            }
+
+            // Clean rates - extract numeric values, handle "subject to IHC" notes
+            $lka20Clean = $this->extractNumericRate($lka20);
+            $lka40Clean = $this->extractNumericRate($lka40);
+            $lcb20Clean = $this->extractNumericRate($lcb20);
+            $lcb40Clean = $this->extractNumericRate($lcb40);
+            $rf20Clean = $this->extractNumericRate($rf20);
+            $rf40Clean = $this->extractNumericRate($rf40);
+
+            // Skip if no valid rates at all
+            if (empty($lka20Clean) && empty($lka40Clean) && empty($lcb20Clean) && empty($lcb40Clean)) {
+                continue;
+            }
+
+            // Check for "subject to IHC" remark
+            $remark = '';
+            if (preg_match('/subject to IHC/i', $lka20 . $lka40 . $lcb20 . $lcb40)) {
+                $remark = 'Subject to IHC';
+            }
+
+            // Determine if LKA and LCB have the same rates
+            $hasLka = !empty($lka20Clean) || !empty($lka40Clean);
+            $hasLcb = !empty($lcb20Clean) || !empty($lcb40Clean);
+            $lkaIsX = preg_match('/^X$/i', trim($lka20)) || preg_match('/^X$/i', trim($lka40));
+            $lcbIsX = preg_match('/^X$/i', trim($lcb20)) || preg_match('/^X$/i', trim($lcb40));
+
+            $sameDryRates = $hasLka && $hasLcb && !$lkaIsX && !$lcbIsX
+                && $lka20Clean === $lcb20Clean && $lka40Clean === $lcb40Clean;
+
+            // Build extra fields
+            $extraFields = [
+                'VALIDITY' => $validity,
+                'REMARK' => $remark,
+            ];
+
+            // Add RF rates if present
+            if (!empty($rf20Clean) || !empty($rf40Clean)) {
+                $extraFields['20 RF'] = $rf20Clean;
+                $extraFields['40RF'] = $rf40Clean;
+            }
+
+            // Create rate entries
+            if ($sameDryRates) {
+                // Both LKA and LCB have same DRY rates - use combined POL
+                $rates[] = $this->createRateEntry('WANHAI', 'LKA/LCB', $podClean, $lka20Clean, $lka40Clean, $extraFields);
+            } else {
+                // Different rates - create separate entries
+                if ($hasLka && !$lkaIsX) {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LKA', $podClean, $lka20Clean, $lka40Clean, $extraFields);
+                }
+                if ($hasLcb && !$lcbIsX) {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LCB', $podClean, $lcb20Clean, $lcb40Clean, $extraFields);
+                }
+            }
+        }
+
+        // Handle TABLE 2 as special case - Delhi/Ahmedabad ICDs via Mundra
+        // Combined POD name from the OCR data
+        $table2Pod = "INDEL/INDRI/INGGN/INKNU/INPTL/INAMD/INJAI/INLDA/INAMD -DELHI-TUGHLAKABAD -DADRI -GURGAON (GARHI HARSARU) -KANPUR -PATLI -AHMEDABAD -JAIPUR -LUDHIANA -AHMEDABAD *VIA MUNDRA**";
+
+        // Extract rates from TABLE 2 - parse the lines again looking for TABLE 2 data
+        $inTable2 = false;
+        $table2Lka20 = '';
+        $table2Lka40 = '';
+        $table2Lcb20 = '';
+        $table2Lcb40 = '';
+
+        foreach ($lines as $line) {
+            if (preg_match('/^TABLE 2/', $line)) {
+                $inTable2 = true;
+                continue;
+            }
+            if ($inTable2 && preg_match('/^TABLE \d+/', $line)) {
+                break; // Next table
+            }
+
+            if ($inTable2 && preg_match('/^Row \d+:\s*(.+)/', $line, $matches)) {
+                $cells = array_map('trim', explode('|', $matches[1]));
+                // Extract rates from cells
+                foreach ($cells as $cell) {
+                    if (preg_match('/^(\d+)\s*subject to IHC/i', $cell, $rateMatch)) {
+                        $rate = $rateMatch[1];
+                        if (empty($table2Lka20)) {
+                            $table2Lka20 = $rate;
+                        } elseif (empty($table2Lka40)) {
+                            $table2Lka40 = $rate;
+                        } elseif (empty($table2Lcb20)) {
+                            $table2Lcb20 = $rate;
+                        } elseif (empty($table2Lcb40)) {
+                            $table2Lcb40 = $rate;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add TABLE 2 entries if we found rates
+        if (!empty($table2Lka20) || !empty($table2Lcb20)) {
+            $extraFields = [
+                'VALIDITY' => $validity,
+                'REMARK' => 'Subject to IHC',
+            ];
+
+            $hasLka = !empty($table2Lka20) || !empty($table2Lka40);
+            $hasLcb = !empty($table2Lcb20) || !empty($table2Lcb40);
+            $sameDryRates = $hasLka && $hasLcb
+                && $table2Lka20 === $table2Lcb20 && $table2Lka40 === $table2Lcb40;
+
+            if ($sameDryRates) {
+                $rates[] = $this->createRateEntry('WANHAI', 'LKA/LCB', $table2Pod, $table2Lka20, $table2Lka40, $extraFields);
+            } else {
+                if ($hasLka) {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LKA', $table2Pod, $table2Lka20, $table2Lka40, $extraFields);
+                }
+                if ($hasLcb) {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LCB', $table2Pod, $table2Lcb20, $table2Lcb40, $extraFields);
+                }
+            }
+        }
+
+        // Handle page overflow: Delhi ICD destinations that Azure didn't detect as table
+        // Look for "PAGE X OVERFLOW CONTENT" sections followed by rates
+        $inOverflow = false;
+        $foundDelhiPod = false;
+        $page2Rates = [];
+
+        // Check if we already have DELHI rates (from TABLE 2 or other source)
+        $hasDelhiRates = false;
+        foreach ($rates as $rate) {
+            if (strpos($rate['POD'] ?? '', 'INDEL') !== false || strpos($rate['POD'] ?? '', 'DELHI') !== false) {
+                $hasDelhiRates = true;
+                break;
+            }
+        }
+
+        // Only add if we don't already have DELHI rates
+        if (!$hasDelhiRates) {
+            // Look for overflow content sections and DELHI ICD pattern
+            foreach ($lines as $line) {
+                // Detect overflow section start
+                if (preg_match('/^PAGE \d+ OVERFLOW CONTENT/', $line)) {
+                    $inOverflow = true;
+                    continue;
+                }
+
+                // Skip separator lines
+                if (preg_match('/^-{10,}$/', $line)) continue;
+
+                // Skip table formatted lines
+                if (preg_match('/^(TABLE|Row) \d+/', $line)) {
+                    $inOverflow = false;
+                    continue;
+                }
+
+                // In overflow section, look for DELHI ICD pattern
+                if ($inOverflow || preg_match('/INDEL\/INDRI|DELHI.TUGHLAKABAD/i', $line)) {
+                    if (preg_match('/INDEL\/INDRI|DELHI.TUGHLAKABAD|A\/INAMD/i', $line)) {
+                        $foundDelhiPod = true;
+                        $table2Pod = "DELHI ICD (TUGHLAKABAD/DADRI/GURGAON/KANPUR/PATLI/AHMEDABAD/JAIPUR/LUDHIANA) VIA MUNDRA";
+                    }
+
+                    // Collect rates that appear after finding DELHI POD
+                    if ($foundDelhiPod && preg_match('/^(\d+)\s*subject to IHC/i', $line, $rateMatch)) {
+                        $page2Rates[] = $rateMatch[1];
+                    }
+                }
+            }
+
+            // If we found 4 rates (LKA20, LKA40, LCB20, LCB40), add the entry
+            if (count($page2Rates) >= 4) {
+                $extraFields = [
+                    'VALIDITY' => $validity,
+                    'REMARK' => 'Subject to IHC',
+                ];
+
+                $p2Lka20 = $page2Rates[0];
+                $p2Lka40 = $page2Rates[1];
+                $p2Lcb20 = $page2Rates[2];
+                $p2Lcb40 = $page2Rates[3];
+
+                // Check if rates are same for LKA and LCB
+                if ($p2Lka20 === $p2Lcb20 && $p2Lka40 === $p2Lcb40) {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LKA/LCB', $table2Pod, $p2Lka20, $p2Lka40, $extraFields);
+                } else {
+                    $rates[] = $this->createRateEntry('WANHAI', 'LKA', $table2Pod, $p2Lka20, $p2Lka40, $extraFields);
+                    $rates[] = $this->createRateEntry('WANHAI', 'LCB', $table2Pod, $p2Lcb20, $p2Lcb40, $extraFields);
+                }
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Extract numeric rate from cell, handling "subject to IHC" and other text
+     */
+    protected function extractNumericRate(string $cell): string
+    {
+        $cell = trim($cell);
+        if (empty($cell) || preg_match('/^(X|N\/A)$/i', $cell)) {
+            return '';
+        }
+        // Remove "subject to IHC" and similar text, keep just the number
+        if (preg_match('/^(\d+)/', $cell, $match)) {
+            return $match[1];
+        }
+        return '';
     }
 
     /**
@@ -1224,6 +1918,13 @@ class RateExtractionService
                 $lcbRate20 = trim($cells[6] ?? '');
                 $lcbRate40 = trim($cells[7] ?? '');
                 $remark = trim($cells[8] ?? '');
+
+                // Handle garbled LCB column where OCR merged all LCB rates into one cell
+                // Extract first pair of numbers like "170 300" from "170 300 N/A N/A 170 300..."
+                if (!empty($lcbRate20) && preg_match('/^(\d+)\s+(\d+)/', $lcbRate20, $lcbMatch)) {
+                    $lcbRate20 = $lcbMatch[1];
+                    $lcbRate40 = $lcbMatch[2];
+                }
             } elseif ($isEmptyFirstCell && count($cells) >= 5) {
                 // Continuation row with empty first cell: "" | POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
                 $pod = trim($cells[1] ?? '');
@@ -1235,7 +1936,7 @@ class RateExtractionService
                 $lcbRate40 = trim($cells[7] ?? '');
                 $remark = trim($cells[8] ?? '');
             } elseif (!$isCountry && !$isEmptyFirstCell && count($cells) >= 7) {
-                // Continuation row without country: POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
+                // Continuation row without country (full): POD | DIRECT/T/S | T/T | BKK20 | BKK40 | LCB20 | LCB40 | ...
                 $pod = $firstCell;
                 $directTs = trim($cells[1] ?? '');
                 $tt = trim($cells[2] ?? '');
@@ -1244,6 +1945,17 @@ class RateExtractionService
                 $lcbRate20 = trim($cells[5] ?? '');
                 $lcbRate40 = trim($cells[6] ?? '');
                 $remark = trim($cells[7] ?? '');
+            } elseif (!$isCountry && !$isEmptyFirstCell && count($cells) >= 4) {
+                // Continuation row without country (BKK only): POD | DIRECT/T/S | T/T | BKK20 | BKK40
+                // This format appears when LCB rates are in a separate merged column (OCR issue)
+                $pod = $firstCell;
+                $directTs = trim($cells[1] ?? '');
+                $tt = trim($cells[2] ?? '');
+                $bkkRate20 = trim($cells[3] ?? '');
+                $bkkRate40 = trim($cells[4] ?? '');
+                // LCB rates may not be present or may be in a garbled format
+                $lcbRate20 = '';
+                $lcbRate40 = '';
             } else {
                 continue;
             }
@@ -1690,8 +2402,8 @@ class RateExtractionService
     /**
      * Parse SM LINE table format (from Azure OCR)
      * Structure: COUNTRY | POD | BKK 20' | BKK 40' | LCH 20' | LCH 40' | REMARK | FREE TIME
-     * POD may have (REEFER) suffix - these go to 20 RF/40RF columns
-     * Columns 1-2 are BKK rates, columns 3-4 are LCH rates (different POL entries)
+     * POD may have (REEFER) suffix - KEEP it in POD name
+     * When BKK and LCH have same rates, output "BKK/LCH" as POL
      */
     protected function parseSmLineTable(array $lines, string $validity): array
     {
@@ -1733,96 +2445,128 @@ class RateExtractionService
             // Skip if POD is empty or looks like header
             if (empty($pod) || preg_match('/^(20|40|CHARGE)/i', $pod)) continue;
 
-            // For SM LINE, rates may have N/A which shifts positions
-            // Collect all $ values and N/A markers
-            $rateValues = [];
-            $remarkFreeTime = [];
+            // SM LINE OCR table format (after POD):
+            // Normal: BKK 20' | BKK 40' | LCH 20' | LCH 40' | Remark | Free Time
+            // When BKK is N/A: N/A | LCH 20' | LCH 40' | Remark | Free Time (collapsed)
+            // Special case SHEKOU: empty | N/A | LCH 20' | LCH 40' | ...
 
-            for ($i = $rateStartIndex; $i < count($cells); $i++) {
-                $cell = $cells[$i];
-                if (preg_match('/^\$?\d+|^N\/A$/i', $cell)) {
-                    $rateValues[] = $cell;
-                } elseif (!empty($cell) && !preg_match('/^\s*$/', $cell)) {
-                    $remarkFreeTime[] = $cell;
-                }
+            // Get remaining cells after POD
+            $remainingCells = array_slice($cells, $rateStartIndex);
+            $numRemaining = count($remainingCells);
+
+            // Determine structure based on content
+            // If first cell is N/A or second cell is N/A and there are fewer rate columns
+            $bkk20 = '';
+            $bkk40 = '';
+            $lch20 = '';
+            $lch40 = '';
+            $remark = '';
+            $freeTime = '';
+
+            // Check if this is a "BKK N/A" row (has N/A in first or second position)
+            $firstCell = strtoupper(trim($remainingCells[0] ?? ''));
+            $secondCell = strtoupper(trim($remainingCells[1] ?? ''));
+
+            if ($firstCell === 'N/A' && $numRemaining >= 4) {
+                // Pattern: N/A | $LCH20 | $LCH40 | Remark | FreeTime
+                $bkk20 = 'N/A';
+                $bkk40 = 'N/A';
+                $lch20 = $remainingCells[1] ?? '';
+                $lch40 = $remainingCells[2] ?? '';
+                $remark = $remainingCells[3] ?? '';
+                $freeTime = $remainingCells[4] ?? '';
+            } elseif ($firstCell === '' && $secondCell === 'N/A' && $numRemaining >= 5) {
+                // Pattern: "" | N/A | $LCH20 | $LCH40 | Remark | FreeTime (SHEKOU case)
+                $bkk20 = '';
+                $bkk40 = 'N/A';
+                $lch20 = $remainingCells[2] ?? '';
+                $lch40 = $remainingCells[3] ?? '';
+                $remark = $remainingCells[4] ?? '';
+                $freeTime = $remainingCells[5] ?? '';
+            } else {
+                // Normal pattern: $BKK20 | $BKK40 | $LCH20 | $LCH40 | Remark | FreeTime
+                $bkk20 = $remainingCells[0] ?? '';
+                $bkk40 = $remainingCells[1] ?? '';
+                $lch20 = $remainingCells[2] ?? '';
+                $lch40 = $remainingCells[3] ?? '';
+                $remark = $remainingCells[4] ?? '';
+                $freeTime = $remainingCells[5] ?? '';
             }
 
-            // We expect 4 rate values: BKK 20', BKK 40', LCH 20', LCH 40'
-            $bkk20 = $rateValues[0] ?? '';
-            $bkk40 = $rateValues[1] ?? '';
-            $lch20 = $rateValues[2] ?? '';
-            $lch40 = $rateValues[3] ?? '';
-
-            // Remark and Free Time are non-rate text at the end
-            $remark = $remarkFreeTime[0] ?? '';
-            $freeTime = $remarkFreeTime[1] ?? '';
-
-            // Clean up rates - extract numeric values
+            // Clean up rates - extract numeric values only
             $bkk20Clean = preg_replace('/[^0-9]/', '', $bkk20);
             $bkk40Clean = preg_replace('/[^0-9]/', '', $bkk40);
             $lch20Clean = preg_replace('/[^0-9]/', '', $lch20);
             $lch40Clean = preg_replace('/[^0-9]/', '', $lch40);
 
-            // Determine if this is a REEFER rate (from POD name)
-            $isReefer = preg_match('/REEFER/i', $pod);
-            $podClean = preg_replace('/\s*\(REEFER\)\s*/i', '', $pod);
-            $podClean = trim($podClean);
+            // Keep REEFER in POD name - just normalize it
+            $podDisplay = strtoupper(trim($pod));
 
-            // Check if rates are valid (not N/A)
-            $hasBkkRates = !empty($bkk20Clean) || !empty($bkk40Clean);
-            $hasLchRates = !empty($lch20Clean) || !empty($lch40Clean);
-            $bkkIsNA = strtoupper($bkk20) === 'N/A' || (empty($bkk20) && strtoupper($bkk40) === 'N/A');
+            // Check if BKK rates are valid (not N/A and not empty)
+            $bkkIsNA = strtoupper(trim($bkk20)) === 'N/A' || strtoupper(trim($bkk40)) === 'N/A';
+            $bkkIsEmpty = empty($bkk20Clean) && empty($bkk40Clean);
+            $hasBkkRates = !$bkkIsNA && !$bkkIsEmpty;
 
-            // Create BKK entry (if not N/A)
-            if ($hasBkkRates && !$bkkIsNA) {
-                $rate20 = !empty($bkk20Clean) ? $bkk20Clean : '';
-                $rate40 = !empty($bkk40Clean) ? $bkk40Clean : '';
+            // Check if LCH rates are valid (not N/A and not empty)
+            $lchIsNA = strtoupper(trim($lch20)) === 'N/A' || strtoupper(trim($lch40)) === 'N/A';
+            $lchIsEmpty = empty($lch20Clean) && empty($lch40Clean);
+            $hasLchRates = !$lchIsNA && !$lchIsEmpty;
 
-                $entry = $this->createRateEntry('SM LINE', 'BKK', strtoupper($podClean),
-                    $isReefer ? '' : $rate20,
-                    $isReefer ? '' : $rate40,
-                    [
-                        'FREE TIME' => $freeTime,
-                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'REMARK' => $remark,
-                    ]);
+            // Determine if BKK and LCH have the same rates
+            $bkkLchSameRates = $hasBkkRates && $hasLchRates
+                && $bkk20Clean === $lch20Clean && $bkk40Clean === $lch40Clean;
 
-                // If REEFER, put rates in RF columns instead
-                if ($isReefer) {
-                    $entry['20 RF'] = $rate20;
-                    $entry['40RF'] = $rate40;
-                }
+            // Check if this is a REEFER rate - put in RF columns instead of regular columns
+            $isReefer = preg_match('/REEFER/i', $podDisplay);
 
-                $rates[] = $entry;
+            // For REEFER rates, remove "(REEFER)" from POD name since rates go in RF columns
+            if ($isReefer) {
+                $podDisplay = preg_replace('/\s*\(?\s*REEFER\s*\)?\s*/i', '', $podDisplay);
+                $podDisplay = trim($podDisplay);
             }
 
-            // Create LCH entry
-            // For REEFER: always create both BKK and LCH entries
-            // For non-REEFER: create LCH if has rates AND (BKK is N/A OR LCH rates are different from BKK)
-            $shouldCreateLch = $isReefer
-                ? $hasLchRates
-                : ($hasLchRates && ($bkkIsNA || $lch20Clean !== $bkk20Clean || $lch40Clean !== $bkk40Clean));
+            // Build extra fields based on whether it's reefer or not
+            $extraFields = [
+                'FREE TIME' => $freeTime,
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ];
 
-            if ($shouldCreateLch) {
-                $rate20 = !empty($lch20Clean) ? $lch20Clean : '';
-                $rate40 = !empty($lch40Clean) ? $lch40Clean : '';
-
-                $entry = $this->createRateEntry('SM LINE', 'LCH', strtoupper($podClean),
-                    $isReefer ? '' : $rate20,
-                    $isReefer ? '' : $rate40,
-                    [
-                        'FREE TIME' => $freeTime,
-                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'REMARK' => $remark,
-                    ]);
-
-                // If REEFER, put rates in RF columns instead
+            if ($bkkLchSameRates) {
+                // Both BKK and LCH have same rates - use combined POL "BKK/LCH"
                 if ($isReefer) {
-                    $entry['20 RF'] = $rate20;
-                    $entry['40RF'] = $rate40;
+                    // REEFER rates go in RF columns, regular columns stay empty
+                    $extraFields['20 RF'] = $bkk20Clean;
+                    $extraFields['40RF'] = $bkk40Clean;
+                    $rates[] = $this->createRateEntry('SM LINE', 'BKK/LCH', $podDisplay, '', '', $extraFields);
+                } else {
+                    $rates[] = $this->createRateEntry('SM LINE', 'BKK/LCH', $podDisplay, $bkk20Clean, $bkk40Clean, $extraFields);
+                }
+            } else {
+                // Different rates - create separate entries
+
+                // Create BKK entry (if has valid rates)
+                if ($hasBkkRates) {
+                    if ($isReefer) {
+                        $extraFields['20 RF'] = $bkk20Clean;
+                        $extraFields['40RF'] = $bkk40Clean;
+                        $rates[] = $this->createRateEntry('SM LINE', 'BKK', $podDisplay, '', '', $extraFields);
+                    } else {
+                        $rates[] = $this->createRateEntry('SM LINE', 'BKK', $podDisplay, $bkk20Clean, $bkk40Clean, $extraFields);
+                    }
                 }
 
-                $rates[] = $entry;
+                // Create LCH entry (if has valid rates)
+                if ($hasLchRates) {
+                    if ($isReefer) {
+                        $lchExtraFields = $extraFields;
+                        $lchExtraFields['20 RF'] = $lch20Clean;
+                        $lchExtraFields['40RF'] = $lch40Clean;
+                        $rates[] = $this->createRateEntry('SM LINE', 'LCH', $podDisplay, '', '', $lchExtraFields);
+                    } else {
+                        $rates[] = $this->createRateEntry('SM LINE', 'LCH', $podDisplay, $lch20Clean, $lch40Clean, $extraFields);
+                    }
+                }
             }
         }
 
@@ -2179,7 +2923,16 @@ class RateExtractionService
             return $dateRange . ' ' . $month . ' ' . $year;
         }
 
-        // Pattern 3: "OF 1 - 15 Nov. 25" or "1-15 Nov 25" (TS LINE format)
+        // Pattern 3: "validity 1-31 Dec" (DONGJIN format - no year, use current year)
+        if (preg_match('/validity\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = date('Y');
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 4: "OF 1 - 15 Nov. 25" or "1-15 Nov 25" (TS LINE format)
         if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*[\'`]?(\d{2,4})/i', $content, $matches)) {
             $startDay = $matches[1];
             $endDay = $matches[2];
@@ -2207,6 +2960,15 @@ class RateExtractionService
             ];
             $month = $monthMap[$monthFull] ?? $monthFull;
 
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 5: "VALID 1-15 DEC" (WANHAI Middle East format - no year, use current year)
+        if (preg_match('/VALID\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = date('Y');
             return "{$startDay}-{$endDay} {$month} {$year}";
         }
 

@@ -148,6 +148,9 @@ class AzureOcrService
             return $lines;
         }
 
+        // Track which pages have tables
+        $pagesWithTables = [];
+
         foreach ($azureResult['analyzeResult']['tables'] as $tableIndex => $table) {
             $lines[] = "TABLE " . ($tableIndex + 1) . " (Rows: " . ($table['rowCount'] ?? 0) . ", Cols: " . ($table['columnCount'] ?? 0) . ")";
             $lines[] = str_repeat('-', 80);
@@ -163,6 +166,13 @@ class AzureOcrService
                         $cells[$row] = [];
                     }
                     $cells[$row][$col] = $content;
+
+                    // Track which pages have table cells
+                    if (isset($cell['boundingRegions'])) {
+                        foreach ($cell['boundingRegions'] as $region) {
+                            $pagesWithTables[$region['pageNumber'] ?? 1] = true;
+                        }
+                    }
                 }
             }
 
@@ -171,6 +181,38 @@ class AzureOcrService
                 $lines[] = "Row $rowIndex: " . implode(' | ', $row);
             }
 
+            $lines[] = "";
+        }
+
+        // Check for paragraphs on pages that don't have tables (continuation pages)
+        // This handles cases where page 2 has table continuation that Azure didn't detect as table
+        $pages = $azureResult['analyzeResult']['pages'] ?? [];
+        $paragraphs = $azureResult['analyzeResult']['paragraphs'] ?? [];
+
+        // Find paragraphs on pages without tables (likely table continuations)
+        $overflowContent = [];
+        foreach ($paragraphs as $paragraph) {
+            $pageNum = 1;
+            if (isset($paragraph['boundingRegions'][0]['pageNumber'])) {
+                $pageNum = $paragraph['boundingRegions'][0]['pageNumber'];
+            }
+
+            // If this paragraph is on a page that doesn't have table cells, it might be overflow content
+            if ($pageNum > 1 && !isset($pagesWithTables[$pageNum])) {
+                $content = $paragraph['content'] ?? '';
+                if (!empty($content)) {
+                    $overflowContent[$pageNum][] = $content;
+                }
+            }
+        }
+
+        // Add overflow content as additional lines for parsers to handle
+        foreach ($overflowContent as $pageNum => $contents) {
+            $lines[] = "PAGE $pageNum OVERFLOW CONTENT";
+            $lines[] = str_repeat('-', 80);
+            foreach ($contents as $content) {
+                $lines[] = $content;
+            }
             $lines[] = "";
         }
 
@@ -235,6 +277,24 @@ class AzureOcrService
             ];
             $month = $monthMap[$monthFull] ?? $monthFull;
 
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 5: "validity 1-31 Dec" (DONGJIN format - no year, use current year)
+        if (preg_match('/validity\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = date('Y');
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
+        // Pattern 6: "VALID 1-15 DEC" (WANHAI Middle East format - no year, use current year)
+        if (preg_match('/VALID\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $month = strtoupper(substr($matches[3], 0, 3));
+            $year = date('Y');
             return "{$startDay}-{$endDay} {$month} {$year}";
         }
 
