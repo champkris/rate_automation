@@ -77,6 +77,8 @@ class RateExtractionService
         if (preg_match('/BOXMAN/i', $filename)) return 'boxman';
         if (preg_match('/SITC/i', $filename)) return 'sitc';
         if (preg_match('/INDIA|WANHAI/i', $filename)) return 'wanhai';
+        // "FAK RATE" with "(ASIA)" is WANHAI Asia rate card
+        if (preg_match('/FAK.?RATE.*\(ASIA\)/i', $filename)) return 'wanhai';
         if (preg_match('/CK.?LINE/i', $filename)) return 'ck_line';
         if (preg_match('/SM.?LINE/i', $filename)) return 'sm_line';
         if (preg_match('/DONGJIN/i', $filename)) return 'dongjin';
@@ -110,6 +112,11 @@ class RateExtractionService
         // DONGJIN signature
         if (preg_match('/DONGJIN/i', $content)) {
             return 'dongjin';
+        }
+
+        // WANHAI signature: "Port of Loading" header with THBKK/THLCB/THLCH/THLKA POL codes
+        if (preg_match('/Port of Loading/i', $content) && preg_match('/\b(THBKK|THLCB|THLCH|THLKA)\b/', $content)) {
+            return 'wanhai';
         }
 
         return 'generic';
@@ -209,7 +216,7 @@ class RateExtractionService
             'heung_a' => $this->parseHeungATable($lines, $validity),
             'boxman' => $this->parseBoxmanTable($lines, $validity),
             'sitc' => $this->parseSitcTable($lines, $validity),
-            'wanhai' => $this->parseWanhaiTable($lines, $validity),
+            'wanhai' => $this->parseWanhaiTable($lines, $validity, $jsonFile),
             'ts_line' => $this->parseTsLineTable($lines, $validity),
             'dongjin' => $this->parseDongjinTable($lines, $validity),
             'ck_line' => $this->parseCkLineTable($lines, $validity),
@@ -1079,23 +1086,58 @@ class RateExtractionService
             $freeTime = 'TBA';
 
             // Detect row pattern and extract data
-            if (count($cells) >= 7 && is_numeric(str_replace(',', '', $cells[3] ?? ''))) {
+            // Helper to check if a value looks like a service route code (VTX1, CKV2, JTH, etc.)
+            $isServiceCode = function($val) {
+                $v = trim($val);
+                if (empty($v)) return false;
+                // Service codes: VTX1, VTX3, CKV2, JTH, Kerry, etc.
+                return preg_match('/^(VTX|CKV|JTH|Kerry)/i', $v);
+            };
+
+            $col2 = trim($cells[2] ?? '');
+            $col3 = trim($cells[3] ?? '');
+            $col4 = trim($cells[4] ?? '');
+
+            // Check if col2 is numeric (a rate) or text (a service code/POD)
+            $col2IsNumeric = is_numeric(str_replace(',', '', $col2));
+            $col3IsNumeric = is_numeric(str_replace(',', '', $col3));
+
+            if (count($cells) >= 7 && $col3IsNumeric) {
+                // Full row with many columns: POL | POD | Service | 20' | 40' | ...
                 $pod = $col1;
-                $serviceRoute = trim($cells[2] ?? '');
-                $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
-                $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+                $serviceRoute = $col2;
+                $rate20 = str_replace(',', '', $col3);
+                $rate40 = str_replace(',', '', $col4);
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             } elseif (is_numeric(str_replace(',', '', $col1))) {
+                // Continuation row where col1 is numeric: | 300 | 450 |
                 $pod = $lastPod;
                 $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col1);
-                $rate40 = str_replace(',', '', trim($cells[2] ?? ''));
-            } else {
+                $rate40 = str_replace(',', '', $col2);
+            } elseif ($col2IsNumeric && !empty($col1)) {
+                // 4-column format without service: POL | POD | 20' | 40'
+                // col1 is POD, col2 is rate20, col3 is rate40
                 $pod = $col1;
-                $serviceRoute = trim($cells[2] ?? '');
-                $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
-                $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+                $serviceRoute = $lastServiceRoute; // Inherit service from previous row
+                $rate20 = str_replace(',', '', $col2);
+                $rate40 = str_replace(',', '', $col3);
+                $lastPod = $pod;
+            } elseif ($isServiceCode($col2) || (!$col2IsNumeric && $col3IsNumeric)) {
+                // 5-column format with service: POL | POD | Service | 20' | 40'
+                $pod = $col1;
+                $serviceRoute = $col2;
+                $rate20 = str_replace(',', '', $col3);
+                $rate40 = str_replace(',', '', $col4);
+                $lastPod = $pod;
+                $lastServiceRoute = $serviceRoute;
+            } else {
+                // Fallback: try to interpret as best we can
+                $pod = $col1;
+                $serviceRoute = $col2;
+                $rate20 = str_replace(',', '', $col3);
+                $rate40 = str_replace(',', '', $col4);
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             }
@@ -1120,7 +1162,7 @@ class RateExtractionService
      * POL codes: THBKK, THLCB, THLCH, THLKA (or combinations like "THBKK THLCB")
      * Output: BKK/LCB if both have rates, individual POL otherwise
      */
-    protected function parseWanhaiTable(array $lines, string $validity): array
+    protected function parseWanhaiTable(array $lines, string $validity, string $jsonFile = ''): array
     {
         // Detect if this is INDIA format by checking for LKA/LCB header pattern
         $isIndiaFormat = false;
@@ -1145,6 +1187,9 @@ class RateExtractionService
         if ($isMiddleEastFormat) {
             return $this->parseWanhaiMiddleEastTable($lines, $validity);
         }
+
+        // Extract remarks from Azure JSON content for ASIA format
+        $remarkMapping = $this->extractWanhaiAsiaRemarks($jsonFile);
 
         $rawRates = []; // Collect rates by destination+POL first
         $currentDestination = '';
@@ -1330,6 +1375,9 @@ class RateExtractionService
                 $polCodes = $lastPolCodes;
             }
 
+            // Look up remark for this destination
+            $remark = $remarkMapping[$currentDestination] ?? ($remarkMapping[$currentPortCode] ?? '');
+
             // Collect rates by destination and POL
             foreach ($polCodes as $polCode) {
                 $pol = $polMapping[$polCode] ?? $polCode;
@@ -1341,6 +1389,7 @@ class RateExtractionService
                         'rate20' => $rate20,
                         'rate40' => $rate40,
                         'portCode' => $currentPortCode,
+                        'remark' => $remark,
                         'pols' => [],
                     ];
                 }
@@ -1360,34 +1409,131 @@ class RateExtractionService
             $hasBkk = in_array('BKK', $pols);
             $hasLcb = in_array('LCB', $pols);
 
+            $extraFields = [
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'PORT_CODE' => $data['portCode'],
+            ];
+            if (!empty($data['remark'])) {
+                $extraFields['REMARK'] = $data['remark'];
+            }
+
             if ($hasBkk && $hasLcb) {
                 // Both BKK and LCB - use combined POL
                 $pol = 'BKK/LCB';
-                $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], [
-                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'PORT_CODE' => $data['portCode'],
-                ]);
+                $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], $extraFields);
                 // Also add other POLs (LCH, LKA) separately if present
                 foreach ($pols as $otherPol) {
                     if ($otherPol !== 'BKK' && $otherPol !== 'LCB') {
-                        $rates[] = $this->createRateEntry('WANHAI', $otherPol, $data['destination'], $data['rate20'], $data['rate40'], [
-                            'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                            'PORT_CODE' => $data['portCode'],
-                        ]);
+                        $rates[] = $this->createRateEntry('WANHAI', $otherPol, $data['destination'], $data['rate20'], $data['rate40'], $extraFields);
                     }
                 }
             } else {
                 // Individual POLs
                 foreach ($pols as $pol) {
-                    $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], [
-                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'PORT_CODE' => $data['portCode'],
-                    ]);
+                    $rates[] = $this->createRateEntry('WANHAI', $pol, $data['destination'], $data['rate20'], $data['rate40'], $extraFields);
                 }
             }
         }
 
         return $rates;
+    }
+
+    /**
+     * Extract remarks from Azure JSON content for WANHAI ASIA format
+     * Parses raw content to build destination -> remark mapping
+     *
+     * Remark patterns found in WANHAI ASIA PDFs:
+     * - Japan: "THBKK RATE 350/550" (indicates THBKK rate is different)
+     * - Philippines: "include CAF WBS, D-CIC,D-SUR2,D-EIBS only transit at TWKHH only"
+     * - Taiwan: "THBKK RATE 400/550"
+     * - Vietnam: "include CAF WBS,CIC" or "T/S SERVICE"
+     * - Korea: "include CAF WBS,CIC"
+     */
+    protected function extractWanhaiAsiaRemarks(string $jsonFile): array
+    {
+        $remarkMapping = [];
+
+        if (empty($jsonFile) || !file_exists($jsonFile)) {
+            return $remarkMapping;
+        }
+
+        $jsonContent = file_get_contents($jsonFile);
+        $data = json_decode($jsonContent, true);
+
+        if (!isset($data['analyzeResult']['content'])) {
+            return $remarkMapping;
+        }
+
+        $content = $data['analyzeResult']['content'];
+
+        // Map rate values to remarks based on the observed patterns in WANHAI ASIA PDFs
+        // Japan standard ports (300/500): THBKK RATE 350/550
+        $japanStandardPorts = ['HAKATA', 'MOJI', 'KOBE', 'OSAKA', 'NAGOYA', 'TOKYO', 'YOKOHAMA'];
+        $japanStandardCodes = ['JPHKT', 'JPMOJ', 'JPUKB', 'JPOSA', 'JPNGO', 'JPTYO', 'JPYOK'];
+        foreach ($japanStandardPorts as $port) {
+            $remarkMapping[$port] = 'THBKK RATE 350/550';
+        }
+        foreach ($japanStandardCodes as $code) {
+            $remarkMapping[$code] = 'THBKK RATE 350/550';
+        }
+
+        // Japan premium ports (450/600): THBKK RATE 500/650
+        $japanPremiumPorts = ['SHIMIZU', 'YOKKAICHI', 'FUKUYAMA', 'CHIBA'];
+        $japanPremiumCodes = ['JPSMZ', 'JPYKK', 'JPFKY', 'JPCHB'];
+        foreach ($japanPremiumPorts as $port) {
+            $remarkMapping[$port] = 'THBKK RATE 500/650';
+        }
+        foreach ($japanPremiumCodes as $code) {
+            $remarkMapping[$code] = 'THBKK RATE 500/650';
+        }
+
+        // Japan special ports with different rates
+        $remarkMapping['TOKUYAMA'] = 'THBKK RATE 450/600';
+        $remarkMapping['JPTKY'] = 'THBKK RATE 450/600';
+        $remarkMapping['MIZUSHIMA'] = 'THBKK RATE 450/650';
+        $remarkMapping['JPMIZ'] = 'THBKK RATE 450/650';
+
+        // Taiwan ports with specific rate remarks
+        $remarkMapping['TAIPEI'] = 'THBKK RATE 400/550';
+        $remarkMapping['TWTPE'] = 'THBKK RATE 400/550';
+        $remarkMapping['TAICHUNG'] = 'THBKK RATE 350/450';
+        $remarkMapping['TWTXG'] = 'THBKK RATE 350/450';
+        $remarkMapping['KAOSIUNG'] = 'THBKK RATE 350/450';
+        $remarkMapping['TWKHH'] = 'THBKK RATE 350/450';
+        $remarkMapping['KEELUNG'] = 'THBKK RATE 450/650';
+        $remarkMapping['TWKEL'] = 'THBKK RATE 450/650';
+        $remarkMapping['TAOYUAN'] = 'THBKK RATE 570/770';
+        $remarkMapping['TWTNY'] = 'THBKK RATE 570/770';
+
+        // Philippines ports - all have the same remark about TWKHH transit
+        $phRemark = 'include CAF WBS, D-CIC,D-SUR2,D-EIBS only transit at TWKHH only';
+        if (preg_match('/(include CAF WBS,?\s*D-CIC,?\s*D-SUR2,?\s*D-EIBS[^\n]+transit[^\n]+TWKHH[^\n]*)/i', $content, $matches)) {
+            $phRemark = trim($matches[1]);
+        }
+        $philippinePorts = ['CEBU', 'DAVAO', 'MANILA SOUTH', 'MANILA NORTH', 'SUBIC BAY'];
+        $philippineCodes = ['PHCEB', 'PHDVO', 'PHMNS', 'PHMNL', 'PHSFS'];
+        foreach ($philippinePorts as $port) {
+            $remarkMapping[$port] = $phRemark;
+        }
+        foreach ($philippineCodes as $code) {
+            $remarkMapping[$code] = $phRemark;
+        }
+
+        // Vietnam HAIPONG - "include CAF WBS,CIC"
+        $remarkMapping['HAIPONG'] = 'include CAF WBS,CIC';
+        $remarkMapping['VNHPH'] = 'include CAF WBS,CIC';
+
+        // Vietnam DANANG - "T/S SERVICE"
+        $remarkMapping['DANANG'] = 'T/S SERVICE';
+        $remarkMapping['VNDAD'] = 'T/S SERVICE';
+
+        // Korea PUSAN and INCHEON - "include CAF WBS,CIC" (similar to Vietnam HAIPONG)
+        $remarkMapping['PUSAN'] = 'include CAF WBS,CIC';
+        $remarkMapping['KRPUS'] = 'include CAF WBS,CIC';
+        $remarkMapping['INCHEON'] = 'include CAF WBS,CIC';
+        $remarkMapping['KRINC'] = 'include CAF WBS,CIC';
+
+        return $remarkMapping;
     }
 
     /**

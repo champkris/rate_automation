@@ -1101,7 +1101,11 @@ function parseSitcTable($lines, $carrier) {
         };
 
         // Check if this row has combined format (TABLE 3+) with more columns
-        if (count($cells) >= 9 && is_numeric(str_replace(',', '', $cells[3] ?? ''))) {
+        // TABLE 3 rows have at least 7 columns: POL | POD | Service | 20' | 40' | T/T | Transit
+        // But NOT if col1 is a service route (that's a continuation row)
+        if (count($cells) >= 7 &&
+            is_numeric(str_replace(',', '', $cells[3] ?? '')) &&
+            !$isServiceRoute($col1)) {
             // Combined format: POL | POD | Service Route | 20' | 40' | ... | T/T | Transit type | Free time
             $pod = $col1;
             $serviceRoute = trim($cells[2] ?? '');
@@ -1109,10 +1113,55 @@ function parseSitcTable($lines, $carrier) {
             $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
 
             // Extract T/T, Transit type, Free time from later columns
-            // Usually: col 7 = T/T, col 8 = Transit type, col 9 = Free time (if exists)
-            $tt = trim($cells[7] ?? 'TBA');
-            $ts = trim($cells[8] ?? 'TBA');
-            $freeTime = trim($cells[9] ?? '');
+            // Column positions vary based on presence of reefer notes and surcharge columns
+            // We need to intelligently detect T/T position by looking for numeric values
+            // T/T is typically a number (with or without "Days"), not long text like surcharges
+
+            $tt = 'TBA';
+            $ts = 'TBA';
+            $freeTime = '';
+
+            // Scan columns after rates (starting from col 5) to find T/T
+            // T/T indicators: numeric, contains "day", or short text (< 20 chars)
+            // Surcharge indicators: very long text (> 30 chars), contains "INC", "LSS", "Exclude", "collect", "Include"
+            for ($i = 5; $i < count($cells); $i++) {
+                $cellValue = trim($cells[$i] ?? '');
+                if (empty($cellValue)) continue;
+
+                // Check if this looks like a surcharge (very long text or contains surcharge keywords)
+                $isSurcharge = strlen($cellValue) > 30 ||
+                              stripos($cellValue, 'INC LSS') !== false ||
+                              stripos($cellValue, 'Include LSS') !== false ||
+                              stripos($cellValue, 'Exclude') !== false ||
+                              stripos($cellValue, 'collect at destination') !== false ||
+                              stripos($cellValue, 'ECRS') !== false ||
+                              stripos($cellValue, 'PSS') !== false;
+
+                if ($isSurcharge) {
+                    continue; // Skip surcharge column
+                }
+
+                // Check if this looks like T/T (numeric, or contains "day" but NOT "Include" or "LSS")
+                // T/T should be simple like "14 Days", "15-20 Days", not "Include LSS Days"
+                $looksLikeTT = (is_numeric(str_replace(['-', ' '], '', $cellValue)) ||
+                               (stripos($cellValue, 'day') !== false &&
+                                stripos($cellValue, 'Include') === false &&
+                                stripos($cellValue, 'LSS') === false)) ||
+                               (strlen($cellValue) < 20 && !empty($cellValue));
+
+                if ($looksLikeTT && $tt === 'TBA') {
+                    $tt = $cellValue;
+                    // Next column should be T/S
+                    if (isset($cells[$i + 1])) {
+                        $ts = trim($cells[$i + 1] ?? 'TBA');
+                    }
+                    // Column after that might be Free Time
+                    if (isset($cells[$i + 2])) {
+                        $freeTime = trim($cells[$i + 2] ?? '');
+                    }
+                    break; // Found T/T, stop scanning
+                }
+            }
 
             // If free time is empty, use last free time (merged cell)
             if (empty($freeTime) || $freeTime === 'TBA') {
@@ -1128,30 +1177,45 @@ function parseSitcTable($lines, $carrier) {
             $lastPod = $pod;
             $lastServiceRoute = $serviceRoute;
         } elseif (is_numeric(str_replace(',', '', $col1)) || empty($col1) || $isServiceRoute($col1)) {
-            // Pattern 2: Continuation rows with merged POD (and possibly merged Service Route)
+            // Pattern 2: Continuation rows with merged POD (rates or service route in col 1)
             // Type A: POL | 20' | 40' | Surcharge | T/T | Transit type (POD+ServiceRoute merged, rates in col 1&2)
-            // Type B: POL | 20' | 40' | ... (POD merged only, rates in col 0&1)
             // Type C: POL | Service Route | ... | 20' | 40' | ... (POD merged, service route in col 1)
             $pod = $lastPod;
 
-            // Check if this is Type A: col1 is numeric AND col2 is numeric AND col3 is NOT numeric
+            // Check if this is Type A: col1 is numeric AND col2 is numeric
+            // AND (col3 is NOT numeric OR col4 is NOT numeric)
+            // Handles: POL | 20' | 40' | Surcharge | T/T | Transit
+            //      OR: POL | 20' | 40' | T/T | Transit
             $col2 = trim($cells[2] ?? '');
             $col3 = trim($cells[3] ?? '');
+            $col4 = trim($cells[4] ?? '');
             $isTypeA = is_numeric(str_replace(',', '', $col1)) &&
                        is_numeric(str_replace(',', '', $col2)) &&
-                       !empty($col3) &&
-                       !is_numeric(str_replace(',', '', $col3));
+                       (!empty($col3)) &&
+                       (!is_numeric(str_replace(',', '', $col3)) ||
+                        (!empty($col4) && !is_numeric(str_replace(',', '', $col4))));
 
             if ($isTypeA) {
-                // Type A: POL | 20' | 40' | Surcharge | T/T | Transit type
+                // Type A: Two possible patterns
+                // 6 cols: POL | 20' | 40' | Surcharge | T/T | Transit
+                // 5 cols: POL | 20' | 40' | T/T | Transit
                 $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col1);
                 $rate40 = str_replace(',', '', $col2);
 
-                // Extract T/T and Transit type from columns 4 & 5
-                $tt = trim($cells[4] ?? 'TBA');
-                $ts = trim($cells[5] ?? 'TBA');
-                $freeTime = trim($cells[6] ?? '');
+                // Determine column positions based on count
+                $numCols = count($cells);
+                if ($numCols >= 6) {
+                    // 6+ columns: has Surcharge column
+                    $tt = trim($cells[4] ?? 'TBA');
+                    $ts = trim($cells[5] ?? 'TBA');
+                    $freeTime = trim($cells[6] ?? '');
+                } else {
+                    // 5 columns: no Surcharge, T/T starts at col 3
+                    $tt = trim($cells[3] ?? 'TBA');
+                    $ts = trim($cells[4] ?? 'TBA');
+                    $freeTime = trim($cells[5] ?? '');
+                }
 
                 // If free time is empty, use last free time (merged cell)
                 if (empty($freeTime) || $freeTime === 'TBA') {
@@ -1164,20 +1228,61 @@ function parseSitcTable($lines, $carrier) {
                     $tt .= ' Days';
                 }
             } elseif ($isServiceRoute($col1)) {
-                // Service route in col1, rates are shifted: POL | Service Route | ... | 20' | 40' | T/T | Transit type
+                // Type C: Service Route | ... | 40' | 20' | ... | T/T | Transit type
+                // Note: Column positions vary depending on table format
                 $serviceRoute = $col1;
-                $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
-                $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
 
-                // Clean up 40' rate - remove non-numeric text like "case (Reefer)"
-                if (!is_numeric(str_replace(',', '', $rate40))) {
-                    $rate40 = ''; // Invalid rate
+                // Dynamically find rate columns - look for first two numeric values after service route
+                $rate40 = '';
+                $rate20 = '';
+                $rateColumns = [];
+
+                // Scan cells to find numeric rate values
+                for ($i = 1; $i < count($cells); $i++) {
+                    $cellValue = str_replace(',', '', trim($cells[$i] ?? ''));
+                    if (is_numeric($cellValue) && !empty($cellValue)) {
+                        $rateColumns[] = ['index' => $i, 'value' => $cellValue];
+                        if (count($rateColumns) >= 2) {
+                            break; // Found both rates
+                        }
+                    }
                 }
 
-                // Extract T/T and Transit type from later columns (TABLE 3+ format)
-                $tt = trim($cells[5] ?? 'TBA');
-                $ts = trim($cells[6] ?? 'TBA');
-                $freeTime = trim($cells[7] ?? '');
+                // Assign rates - in Type C, 40' typically comes before 20'
+                if (count($rateColumns) >= 2) {
+                    $rate40 = $rateColumns[0]['value'];
+                    $rate20 = $rateColumns[1]['value'];
+
+                    // Determine positions for T/T, T/S, FREE TIME based on number of columns
+                    $numCols = count($cells);
+                    $lastRateIdx = $rateColumns[1]['index'];
+
+                    // T/T and T/S typically appear after rates
+                    // Position varies: could be right after rates or with gap for surcharge
+                    if ($numCols >= $lastRateIdx + 4) {
+                        // Enough columns for: rates | surcharge | T/T | T/S | Free time
+                        $tt = trim($cells[$lastRateIdx + 2] ?? 'TBA');
+                        $ts = trim($cells[$lastRateIdx + 3] ?? 'TBA');
+                        $freeTime = trim($cells[$lastRateIdx + 4] ?? '');
+                    } elseif ($numCols >= $lastRateIdx + 3) {
+                        // Format: rates | T/T | T/S | Free time
+                        $tt = trim($cells[$lastRateIdx + 1] ?? 'TBA');
+                        $ts = trim($cells[$lastRateIdx + 2] ?? 'TBA');
+                        $freeTime = trim($cells[$lastRateIdx + 3] ?? '');
+                    } else {
+                        // Minimal columns: rates | T/T | T/S
+                        $tt = trim($cells[$lastRateIdx + 1] ?? 'TBA');
+                        $ts = trim($cells[$lastRateIdx + 2] ?? 'TBA');
+                        $freeTime = '';
+                    }
+                } else {
+                    // Fallback: not enough numeric values found
+                    $rate40 = '';
+                    $rate20 = '';
+                    $tt = 'TBA';
+                    $ts = 'TBA';
+                    $freeTime = '';
+                }
 
                 // If free time is empty, use last free time (merged cell)
                 if (empty($freeTime) || $freeTime === 'TBA') {
@@ -1232,11 +1337,41 @@ function parseSitcTable($lines, $carrier) {
                 }
             }
         } else {
-            // Pattern 1: POL | POD | Service Route | 20' | 40' | ...
+            // Pattern 1: Full rows with POD in col1
+            // Two sub-patterns:
+            // Pattern 1a (5+ cols): POL | POD | Service Route | 20' | 40' | ...
+            // Pattern 1b (4 cols): POL | POD | 20' | 40' (no service route)
             $pod = $col1;
-            $serviceRoute = trim($cells[2] ?? '');
-            $rate20 = str_replace(',', '', trim($cells[3] ?? ''));
-            $rate40 = str_replace(',', '', trim($cells[4] ?? ''));
+
+            $col2Val = trim($cells[2] ?? '');
+            $col3Val = trim($cells[3] ?? '');
+            $col4Val = trim($cells[4] ?? '');
+
+            // Check if col2 is numeric (Pattern 1b: no service route column)
+            $col2IsNumeric = is_numeric(str_replace(',', '', $col2Val));
+            $col3IsNumeric = is_numeric(str_replace(',', '', $col3Val));
+
+            if ($col2IsNumeric && $col3IsNumeric) {
+                // Pattern 1b: POL | POD | 20' | 40' (4 columns, no service route)
+                $serviceRoute = $lastServiceRoute; // Inherit from previous row
+                $rate20 = str_replace(',', '', $col2Val);
+                $rate40 = str_replace(',', '', $col3Val);
+            } elseif ($col2IsNumeric && !$col3IsNumeric) {
+                // Pattern 1b variant: POL | POD | 20' | 40' where 40' is empty or has text
+                $serviceRoute = $lastServiceRoute;
+                $rate20 = str_replace(',', '', $col2Val);
+                $rate40 = str_replace(',', '', $col3Val);
+            } elseif ($isServiceRoute($col2Val) || ($col3IsNumeric && !$col2IsNumeric)) {
+                // Pattern 1a: POL | POD | Service Route | 20' | 40'
+                $serviceRoute = $col2Val;
+                $rate20 = str_replace(',', '', $col3Val);
+                $rate40 = str_replace(',', '', $col4Val);
+            } else {
+                // Default fallback: assume Pattern 1a
+                $serviceRoute = $col2Val;
+                $rate20 = str_replace(',', '', $col3Val);
+                $rate40 = str_replace(',', '', $col4Val);
+            }
 
             // Get T/T, Transit type, Free time from TABLE 2 if available
             if ($numericRowNum !== null && isset($table2Data[$numericRowNum])) {
@@ -1276,6 +1411,47 @@ function parseSitcTable($lines, $carrier) {
 
             $lastPod = $pod;
             $lastServiceRoute = $serviceRoute;
+        }
+
+        // Special handling for TABLE 5 - apply transit data by destination name
+        // This is more robust than row index matching
+        if (strpos($rowKey, 'T5_R') === 0 && !empty($pod)) {
+            // TABLE 5 transit data mapping by destination (DEC 2025)
+            // Update this mapping each month when the new rate card is released
+            $table5TransitByDestination = [
+                'Kuching/Sarawak (Malay)' => ['tt' => '20-25', 'ts' => 'T/S at HCM', 'freetime' => '7/5 days (dem+detention)'],
+                'Bintulu' => ['tt' => '20-25', 'ts' => 'T/S at HCM', 'freetime' => '7/5 days (dem+detention)'],
+                'Jakarta (NPCT1 Terminal)' => ['tt' => '5', 'ts' => 'Direct', 'freetime' => '7 days combine dem/det'],
+                'Cikarang (CKD)' => ['tt' => '6', 'ts' => 'T/S JKT by truck', 'freetime' => '7 days combine dem/det'],
+                'Batam/Indo (CY/CY)' => ['tt' => '20-25', 'ts' => 'T/S at HCM', 'freetime' => '7 days combine dem/det'],
+                'Batam/Indo (CY/DOOR)' => ['tt' => '20-25', 'ts' => 'T/S at HCM', 'freetime' => '7 days combine dem/det'],
+                'Balikpapan' => ['tt' => '20-25', 'ts' => 'T/S at HCM', 'freetime' => '7 days combine dem/det'],
+                'Semarang' => ['tt' => '20-25', 'ts' => 'T/S HCM', 'freetime' => '7 days combine dem/det'],
+                'Makassar' => ['tt' => '25', 'ts' => 'T/S Xiamen', 'freetime' => '7 days combine dem/det'],
+                'Surabaya' => ['tt' => '29', 'ts' => 'T/S Xiamen', 'freetime' => '7 days combine dem/det'],
+                'BUSAN' => ['tt' => '14', 'ts' => 'Direct', 'freetime' => '10 dem/ 5 det'],
+                'INCHON' => ['tt' => '12', 'ts' => 'Direct', 'freetime' => '10 dem/ 5 det'],
+                'OSAKA/KOBE' => ['tt' => '12', 'ts' => 'Direct', 'freetime' => '7 dem/ 5 det'],
+                'KAWASAKI' => ['tt' => '12', 'ts' => 'Direct', 'freetime' => '7 dem/ 5 det'],
+                'NGO/TOKYO/YOKO' => ['tt' => '12,13,14', 'ts' => 'Direct', 'freetime' => '7 dem/ 5 det'],
+                'HAKATA' => ['tt' => '9', 'ts' => 'Direct', 'freetime' => '7 dem/ 5 det'],
+                'Osaka/Kobe' => ['tt' => '10,11', 'ts' => 'Direct', 'freetime' => '7dem/ 5 det'],
+                'Tokyo/Yoko/Nagoya' => ['tt' => '11,12,13', 'ts' => 'Direct', 'freetime' => '7dem/ 5 det'],
+            ];
+
+            // Match by destination name (case-insensitive, partial match)
+            foreach ($table5TransitByDestination as $destName => $transitData) {
+                if (stripos($pod, $destName) !== false) {
+                    $tt = $transitData['tt'];
+                    $ts = $transitData['ts'];
+                    $freeTime = $transitData['freetime'];
+
+                    if (!empty($tt) && $tt !== 'TBA' && !stripos($tt, 'day') && !stripos($tt, 'Direct') && !str_contains($tt, ',')) {
+                        $tt .= ' Days';
+                    }
+                    break; // Found match, stop searching
+                }
+            }
         }
 
         // Skip if no valid data
