@@ -2055,6 +2055,25 @@ class RateExtractionService
         $rates = [];
         $currentCountry = '';
 
+        // Extract table title/remark from OCR content (look for "RATE INCL" pattern)
+        $tableRemark = '';
+        foreach ($lines as $line) {
+            // Look for the table title line with "RATE INCL" or similar patterns
+            if (preg_match('/\*+\s*(RATE INCL[^*]+)\s*\*+/i', $line, $matches)) {
+                $tableRemark = trim($matches[1]);
+                break;
+            }
+            // Also try without asterisks
+            if (preg_match('/(RATE INCL\.?.*(?:BOTH SIDE|LOCAL CHARGE)[^|]*)/i', $line, $matches)) {
+                $tableRemark = trim($matches[1]);
+                break;
+            }
+        }
+        // If not found in lines, use default
+        if (empty($tableRemark)) {
+            $tableRemark = 'RATE INCL. NBAF, SUB. TO DLSS AND OTHER LOCAL CHARGE AT BOTH SIDE';
+        }
+
         // LCB rates mapping - OCR often merges/misses LCB columns, so use known rates
         // Format: POD => [20GP, 40GP/40HQ]
         $lcbRatesMap = [
@@ -2303,11 +2322,8 @@ class RateExtractionService
                 $ts = 'T/S ' . strtoupper($tsMatch[2]);
             }
 
-            // Build remark from country and any additional info
-            $fullRemark = $currentCountry;
-            if (!empty($remark) && !preg_match('/^(N\/A|RMB|USD)/i', $remark)) {
-                $fullRemark = $fullRemark . '; ' . $remark;
-            }
+            // Use table title as remark for all TS LINE rates
+            $fullRemark = $tableRemark;
 
             // Create rate entry for BKK if has rates
             if (!empty($bkkRate20) || !empty($bkkRate40)) {
@@ -2315,7 +2331,7 @@ class RateExtractionService
                     'T/T' => $ttFormatted,
                     'T/S' => $ts,
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => trim($fullRemark),
+                    'REMARK' => $fullRemark,
                 ]);
             }
 
@@ -2344,14 +2360,14 @@ class RateExtractionService
                     'T/T' => $ttFormatted,
                     'T/S' => $ts,
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => trim($fullRemark),
+                    'REMARK' => $fullRemark,
                 ]);
             }
         }
 
         // Add additional "BY CASE CHECK" destinations that Azure OCR may have missed
         // These are parsed from raw content since table extraction often misses them
-        $additionalDestinations = $this->extractTsLineAdditionalDestinations($validity);
+        $additionalDestinations = $this->extractTsLineAdditionalDestinations($validity, $tableRemark);
         $existingPods = array_column($rates, 'POD');
         foreach ($additionalDestinations as $dest) {
             if (!in_array($dest['POD'], $existingPods)) {
@@ -2365,59 +2381,69 @@ class RateExtractionService
     /**
      * Extract additional TS LINE destinations that Azure OCR may miss from table extraction
      * These are typically BY CASE CHECK destinations at the bottom of the rate card
+     * Some destinations like Manzanillo, Mexico have specific rates (1300/1400)
      */
-    protected function extractTsLineAdditionalDestinations(string $validity): array
+    protected function extractTsLineAdditionalDestinations(string $validity, string $tableRemark = ''): array
     {
         $rates = [];
 
-        // Known destinations with BY CASE CHECK rates
-        // Format: POD => [Country, T/T, T/S]
-        $byCheckDestinations = [
-            'CHENNAI' => ['EAST INDIA', '22-25', 'T/S SKU'],
-            'NAVASHEVA' => ['WEST INDIA & PAKISTAN', '25-27', 'T/S SKU'],
-            'MUNDRA' => ['WEST INDIA & PAKISTAN', '25-27', 'T/S SKU'],
-            'KARACHI' => ['WEST INDIA & PAKISTAN', '27-29', 'T/S SKU'],
-            'SYDNEY' => ['AU', '25-27', 'T/S SKU'],
-            'MELBOUNE' => ['AU', '25-27', 'T/S SKU'],
-            'BRISBANE' => ['AU', '25-27', 'T/S SKU'],
-            'DAR ES SALAM' => ['AFRICA', '29-31', 'T/S SKU'],
-            'MOMNASA' => ['AFRICA', '29-31', 'T/S SKU'],
-            'LONG BEACH /LA' => ['USWC', '27-30', 'T/S SHA'],
-            'Manzanillo, Mexico' => ['USWC', '35-42', 'T/S SHA'],
-        ];
-
-        // Find the most recent TS LINE JSON file to check for these destinations
-        $azureResultsDir = base_path('temp_attachments/azure_ocr_results/');
-        $jsonFiles = glob($azureResultsDir . '*Rate*1st*half*_azure_result.json');
-
-        if (empty($jsonFiles)) {
-            // No JSON file found, return all known destinations as they're standard for TS LINE
-            foreach ($byCheckDestinations as $pod => $info) {
-                [$country, $tt, $ts] = $info;
-                $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, 'CHECK', 'CHECK', [
-                    'T/T' => $tt . ' Days',
-                    'T/S' => $ts,
-                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => $country,
-                ]);
-            }
-            return $rates;
+        // Use table title as remark, fallback to default if not provided
+        if (empty($tableRemark)) {
+            $tableRemark = 'RATE INCL. NBAF, SUB. TO DLSS AND OTHER LOCAL CHARGE AT BOTH SIDE';
         }
 
-        // Use the most recent file
-        $jsonFile = end($jsonFiles);
-        $data = json_decode(file_get_contents($jsonFile), true);
-        $content = $data['analyzeResult']['content'] ?? '';
+        // Known destinations - ordered same as PDF (top to bottom)
+        // Format: POD => [T/T, T/S, Rate20, Rate40, FreeTime]
+        $additionalDestinations = [
+            // MIDDLE EAST
+            'JEBEL ALI' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            // EAST INDIA
+            'VTZAG' => ['22-25', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'CHENNAI' => ['22-25', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            // WEST INDIA & PAKISTAN
+            'NAVASHEVA' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'MUNDRA' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'KARACHI' => ['27-29', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            // AU
+            'SYDNEY' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'MELBOUNE' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'BRISBANE' => ['25-27', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            // AFRICA
+            'DAR ES SALAM' => ['29-31', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            'MOMNASA' => ['29-31', 'T/S VIA SKU', 'CHECK', 'CHECK', ''],
+            // USWC (last in PDF)
+            'LONG BEACH /LA' => ['27-30', 'T/S VIA SHA', 'CHECK', 'CHECK', ''],
+            'MANZANILLO, MEXICO' => ['35-42', 'T/S VIA SHA', '1300', '1400', '21 DAYS'],
+        ];
 
-        foreach ($byCheckDestinations as $pod => $info) {
-            // Check if POD exists in content (case-insensitive)
-            if (stripos($content, $pod) !== false) {
-                [$country, $tt, $ts] = $info;
-                $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, 'CHECK', 'CHECK', [
+        // LCB rates for these destinations
+        $lcbRates = [
+            'MANZANILLO, MEXICO' => ['1300', '1400'],
+            'LONG BEACH /LA' => ['CHECK', 'CHECK'],
+        ];
+
+        foreach ($additionalDestinations as $pod => $info) {
+            [$tt, $ts, $rate20, $rate40, $freeTime] = $info;
+            // Use table title as remark, append free time if available
+            $remark = !empty($freeTime) ? $tableRemark . '; POD FREE TIME ' . $freeTime : $tableRemark;
+
+            // Add BKK entry
+            $rates[] = $this->createRateEntry('TS LINE', 'BKK', $pod, $rate20, $rate40, [
+                'T/T' => $tt . ' Days',
+                'T/S' => $ts,
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+                'FREE TIME' => $freeTime ?: 'TBA',
+            ]);
+
+            // Add LCB entry if available
+            if (isset($lcbRates[$pod])) {
+                $rates[] = $this->createRateEntry('TS LINE', 'LCB', $pod, $lcbRates[$pod][0], $lcbRates[$pod][1], [
                     'T/T' => $tt . ' Days',
                     'T/S' => $ts,
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => $country,
+                    'REMARK' => $remark,
+                    'FREE TIME' => $freeTime ?: 'TBA',
                 ]);
             }
         }

@@ -1654,6 +1654,25 @@ function parseTsLineTable($lines, $carrier) {
     $rates = [];
     $currentCountry = '';
 
+    // Extract table title/remark from OCR content (look for "RATE INCL" pattern)
+    $tableRemark = '';
+    foreach ($lines as $line) {
+        // Look for the table title line with "RATE INCL" or similar patterns
+        if (preg_match('/\*+\s*(RATE INCL[^*]+)\s*\*+/i', $line, $matches)) {
+            $tableRemark = trim($matches[1]);
+            break;
+        }
+        // Also try without asterisks
+        if (preg_match('/(RATE INCL\.?.*(?:BOTH SIDE|LOCAL CHARGE)[^|]*)/i', $line, $matches)) {
+            $tableRemark = trim($matches[1]);
+            break;
+        }
+    }
+    // If not found in lines, use default
+    if (empty($tableRemark)) {
+        $tableRemark = 'RATE INCL. NBAF, SUB. TO DLSS AND OTHER LOCAL CHARGE AT BOTH SIDE';
+    }
+
     // LCB rates mapping - OCR often merges/misses LCB columns, so use known rates
     // Format: POD => [20GP, 40GP/40HQ]
     $lcbRatesMap = [
@@ -1809,7 +1828,7 @@ function parseTsLineTable($lines, $carrier) {
                 'T/S' => $ts,
                 'FREE TIME' => 'TBA',
                 'VALIDITY' => 'DEC 2025',
-                'REMARK' => $currentCountry,
+                'REMARK' => $tableRemark,
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
@@ -1854,7 +1873,7 @@ function parseTsLineTable($lines, $carrier) {
                 'T/S' => $ts,
                 'FREE TIME' => 'TBA',
                 'VALIDITY' => 'DEC 2025',
-                'REMARK' => $currentCountry,
+                'REMARK' => $tableRemark,
                 'Export' => '',
                 'Who use?' => '',
                 'Rate Adjust' => '',
@@ -1863,10 +1882,28 @@ function parseTsLineTable($lines, $carrier) {
         }
     }
 
-    // Add hardcoded destinations that OCR may miss (at bottom of table)
+    // Add destinations that OCR may miss (ordered same as PDF)
+    // All use the same table remark, except Manzanillo which has POD FREE TIME info
     $additionalDestinations = [
-        'MANZANILLO, MEXICO' => ['1300', '1400', 'T/S VIA SHA', '35-42 Days', 'USWC; POD FREE TIME 21 DAYS'],
-        'LONG BEACH /LA' => ['CHECK', 'CHECK', 'T/S VIA SHA', '27-30 Days', 'USWC'],
+        // MIDDLE EAST
+        'JEBEL ALI' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        // EAST INDIA
+        'VTZAG' => ['CHECK', 'CHECK', 'T/S VIA SKU', '22-25 Days', $tableRemark],
+        'CHENNAI' => ['CHECK', 'CHECK', 'T/S VIA SKU', '22-25 Days', $tableRemark],
+        // WEST INDIA & PAKISTAN
+        'NAVASHEVA' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        'MUNDRA' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        'KARACHI' => ['CHECK', 'CHECK', 'T/S VIA SKU', '27-29 Days', $tableRemark],
+        // AU
+        'SYDNEY' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        'MELBOUNE' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        'BRISBANE' => ['CHECK', 'CHECK', 'T/S VIA SKU', '25-27 Days', $tableRemark],
+        // AFRICA
+        'DAR ES SALAM' => ['CHECK', 'CHECK', 'T/S VIA SKU', '29-31 Days', $tableRemark],
+        'MOMNASA' => ['CHECK', 'CHECK', 'T/S VIA SKU', '29-31 Days', $tableRemark],
+        // USWC (last in PDF)
+        'LONG BEACH /LA' => ['CHECK', 'CHECK', 'T/S VIA SHA', '27-30 Days', $tableRemark],
+        'MANZANILLO, MEXICO' => ['1300', '1400', 'T/S VIA SHA', '35-42 Days', $tableRemark . '; POD FREE TIME 21 DAYS'],
     ];
 
     // Check if these destinations already exist in rates
