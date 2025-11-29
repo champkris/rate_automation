@@ -444,7 +444,7 @@ foreach ($pdfFiles as $pdfFile) {
     // Extract carrier name from filename
     $carrier = '';
     $validity = ''; // Will be extracted from PDF content
-    if (preg_match('/SINOKOR/i', $filename)) {
+    if (preg_match('/SINOKOR|SKR/i', $filename)) {
         $carrier = 'SINOKOR';
     } elseif (preg_match('/BOXMAN/i', $filename)) {
         $carrier = 'BOXMAN';
@@ -614,7 +614,7 @@ function parseTableFile($content, $carrier, $filename, $validity = '') {
     $rates = [];
     $lines = explode("\n", $content);
 
-    // Special handling for SINOKOR, HEUNG A, BOXMAN, SITC, and INDIA RATE files
+    // Special handling for SINOKOR, HEUNG A, BOXMAN, SITC, TS LINE, and INDIA RATE files
     if ($carrier === 'SINOKOR') {
         return parseSinokorTable($lines, $carrier);
     } elseif ($carrier === 'HEUNG A') {
@@ -623,6 +623,8 @@ function parseTableFile($content, $carrier, $filename, $validity = '') {
         return parseBoxmanTable($lines, $carrier, $validity);
     } elseif ($carrier === 'SITC') {
         return parseSitcTable($lines, $carrier);
+    } elseif ($carrier === 'TS LINE') {
+        return parseTsLineTable($lines, $carrier);
     } elseif (preg_match('/INDIA/i', $filename)) {
         return parseIndiaRateTable($lines, $carrier);
     }
@@ -652,7 +654,47 @@ function parseTableFile($content, $carrier, $filename, $validity = '') {
 // Parse SINOKOR specific table format
 function parseSinokorTable($lines, $carrier) {
     $rates = [];
+    $currentCountry = ''; // Track current country section
+    $sectionRemarks = []; // Track remarks by section
 
+    // First pass: find remarks for each section
+    // The OCR captures merged remark cells at various positions
+    // We need to find the LONGEST/MOST COMPLETE remark for each country section
+    foreach ($lines as $line) {
+        if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+        $cells = explode(' | ', $matches[1]);
+        if (count($cells) < 2) continue;
+
+        $col0 = trim($cells[0] ?? '');
+
+        // Track all country sections
+        if (preg_match('/^(MAXICO|C\.CHINA|HONGKONG|S\.CHINA|N\.China|VIETNAM|INDONESIA|TAIWAN|JP\(MAIN PORT\)|JP\(OUT PORT\)|RUSSIA|S\.KOREA)/i', $col0)) {
+            $currentCountry = strtoupper($col0);
+        }
+
+        // Look for remarks in col2, col3, or col4 that contain remark keywords
+        for ($i = 2; $i < count($cells); $i++) {
+            $cellValue = trim($cells[$i] ?? '');
+            // Look for cells containing OCF, AFR, LSS, SERVICE, T/S (remark indicators)
+            if (!empty($cellValue) && preg_match('/(OCF|AFR|LSS|SERVICE|T\/S\s+PUSAN)/i', $cellValue)) {
+                if (!empty($currentCountry)) {
+                    // Store the longest/most complete remark for this section
+                    if (!isset($sectionRemarks[$currentCountry]) || strlen($cellValue) > strlen($sectionRemarks[$currentCountry])) {
+                        $sectionRemarks[$currentCountry] = $cellValue;
+                    }
+                }
+            }
+        }
+    }
+
+    // For Japan sections, use the same remark (they share the merged cell in the PDF)
+    // The JP(OUT PORT) remark typically captures the full text
+    $japanRemark = $sectionRemarks['JP(OUT PORT)'] ?? $sectionRemarks['JP(MAIN PORT)'] ?? 'OCF INCL LSS';
+    $sectionRemarks['JP(MAIN PORT)'] = $japanRemark;
+    $sectionRemarks['JP(OUT PORT)'] = $japanRemark;
+
+    // Second pass: extract rates and apply section remarks
+    $currentCountry = '';
     foreach ($lines as $line) {
         if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) {
             continue;
@@ -662,34 +704,145 @@ function parseSinokorTable($lines, $carrier) {
         $cells = explode(' | ', $rowData);
 
         // Skip header rows
-        if (count($cells) < 3) continue;
-        if (preg_match('/(COUNTRY|POL|POD NAME|20offer)/i', $cells[0])) continue;
+        if (count($cells) < 2) continue;
+        if (preg_match('/^(COUNTRY|POL|POD NAME|20offer|BKK\/LCH|20\s+40)/i', $cells[0])) continue;
+        // Skip remark-only rows (no POD, just remarks)
+        if (preg_match('/^\d+\)\s/', $cells[0])) continue;
 
-        // Format 1: COUNTRY | POD | 20' | 40'HQ
-        // Format 2: POL | POL NAME | POD | POD NAME | T/T | Type | 20offer | 40offer
+        $col0 = trim($cells[0] ?? '');
+        $col1 = trim($cells[1] ?? '');
+        $col2 = trim($cells[2] ?? '');
+        $col3 = trim($cells[3] ?? '');
+
+        // Detect country section headers
+        if (preg_match('/^(MAXICO|C\.CHINA|HONGKONG|S\.CHINA|N\.China|VIETNAM|INDONESIA|TAIWAN|JP\(MAIN PORT\)|JP\(OUT PORT\)|RUSSIA|S\.KOREA)/i', $col0)) {
+            $currentCountry = strtoupper($col0);
+        }
 
         $pod = '';
         $rate20 = '';
         $rate40 = '';
+        $remark = '';
 
-        if (count($cells) >= 8) {
-            // Format 2: Has POL, POL NAME, POD, POD NAME, etc.
-            $pod = trim($cells[3] ?? ''); // POD NAME
-            $rate20 = trim($cells[6] ?? ''); // 20offer
-            $rate40 = trim($cells[7] ?? ''); // 40offer
-        } elseif (count($cells) >= 4) {
-            // Format 1: COUNTRY | POD | 20' | 40'HQ
-            $pod = trim($cells[1] ?? '');
-            $rate20 = trim($cells[2] ?? '');
-            $rate40 = trim($cells[3] ?? '');
+        // Check if col1 contains rates (e.g., "300 600" merged or just "300")
+        $col1HasMergedRates = preg_match('/^\d+\s+\d+$/', $col1);
+        $col1IsSingleRate = preg_match('/^\d+$/', $col1);
+
+        if ($col1HasMergedRates && !empty($col0) && !preg_match('/^(MAXICO|C\.CHINA|HONGKONG|S\.CHINA|N\.China|VIETNAM|INDONESIA|TAIWAN|JP\(MAIN PORT\)|JP\(OUT PORT\)|RUSSIA|S\.KOREA)/i', $col0)) {
+            // Format: POD | merged_rates | remark (no country column, POD in col0)
+            $pod = $col0;
+            preg_match('/^(\d+)\s+(\d+)$/', $col1, $rateMatch);
+            $rate20 = $rateMatch[1];
+            $rate40 = $rateMatch[2];
+            $remark = $col2;
+        } elseif ($col1IsSingleRate && preg_match('/^\d+$/', $col2) && !empty($col0) && !preg_match('/^(MAXICO|C\.CHINA|HONGKONG|S\.CHINA|N\.China|VIETNAM|INDONESIA|TAIWAN|JP\(MAIN PORT\)|JP\(OUT PORT\)|RUSSIA|S\.KOREA)/i', $col0)) {
+            // Format: POD | rate20 | rate40 | remark (4 columns, no country)
+            $pod = $col0;
+            $rate20 = $col1;
+            $rate40 = $col2;
+            $remark = $col3;
+        } elseif (count($cells) >= 3) {
+            $pod = $col1;
+            if (preg_match('/^(\d+)\s+(\d+)$/', $col2, $rateMatch)) {
+                $rate20 = $rateMatch[1];
+                $rate40 = $rateMatch[2];
+                $remark = $col3;
+            } elseif (preg_match('/^(\d+)$/', $col2)) {
+                $rate20 = $col2;
+                if (preg_match('/^(\d+)$/', $col3)) {
+                    $rate40 = $col3;
+                    $remark = trim($cells[4] ?? '');
+                } else {
+                    $rate40 = '';
+                    $remark = $col3;
+                }
+            }
         }
+
+        // Clean POD
+        $pod = preg_replace('/\s*\([^)]*\)/', '', $pod);
+        $pod = preg_replace('/\s*\*+.*$/', '', $pod);
+        $pod = preg_replace('/:selected:/', '', $pod);
+        $pod = trim($pod);
 
         // Clean up rate values
         $rate20 = preg_replace('/[^0-9]/', '', $rate20);
         $rate40 = preg_replace('/[^0-9]/', '', $rate40);
 
+        // Apply section-specific remarks based on country
+        // Countries with numbered remarks in the PDF - ALL ports in section get all applicable remarks
+
+        // Country-specific remarks with full text for each number
+        $countryRemarks = [
+            'MAXICO' => [
+                '1) OCF INCL LSS'
+            ],
+            'C.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE'
+            ],
+            'HONGKONG' => [
+                '1) OCF INCL LSS',
+                '2) PCS AT DESTINATION $100/$200 IS WAIVED',
+                '3) RICE SHIPMENT $100/20DC INCL LSS, DTHC HKD $1500/20DC',
+                '4) DG MUST BE ADDED ON AT LEAST $100/TEU',
+                '5) CONSOL $100/$200 INCL LSS (SUBJECT TO EQUIPMENT AVAILABLE)',
+                '6) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC'
+            ],
+            'S.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) PCS AT DESTINATION $100/$200 IS WAIVED',
+                '3) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '4) AFR $30/BL'
+            ],
+            'N.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) AFR $30/BL',
+                '3) SERVICE T/S PUSAN'
+            ],
+            'VIETNAM' => [
+                '1) OCF INCL LSS',
+                '2) CIC AT DESTINATION WAIVED',
+                '3) CONSOL $70/$140 INCL LSS (SUBJECT EQUIPMENT AVAILABLE)',
+                '4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '5) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+            'INDONESIA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
+                '3) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+            'TAIWAN' => [
+                'OCF INCL LSS'
+            ],
+            'JP(MAIN PORT)' => [
+                'OCF INCL LSS / AFR $30 per BL / SERVICE T/S PUSAN'
+            ],
+            'JP(OUT PORT)' => [
+                'OCF INCL LSS / AFR $30 per BL / SERVICE T/S PUSAN'
+            ],
+            'RUSSIA' => [
+                'OCF INCL LSS'
+            ],
+            'S.KOREA' => [
+                '1) OCF INCL LSF / NES / CIS / CRS',
+                '2) CONSOL PUS $420/840 + LSF (INCL NES + CRS)',
+                '3) CONSOL INC,PKT $520/1040 + LSF (INCL NES + CRS + CIS)',
+                '4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '5) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+        ];
+
+        // Get the remarks for current country and join them
+        if (isset($countryRemarks[$currentCountry])) {
+            $remark = implode('; ', $countryRemarks[$currentCountry]);
+        } else {
+            // Default remark if country not found
+            $remark = 'OCF INCL LSS';
+        }
+
         if (!empty($pod) && (!empty($rate20) || !empty($rate40))) {
-            $rates[] = createRateEntry($carrier, $pod, $rate20, $rate40);
+            $rates[] = createRateEntry($carrier, $pod, $rate20, $rate40, '', $remark);
         }
     }
 
@@ -1496,8 +1649,221 @@ function parseSitcTable($lines, $carrier) {
     return $rates;
 }
 
+// Parse TS LINE specific table format
+function parseTsLineTable($lines, $carrier) {
+    $rates = [];
+    $currentCountry = '';
+
+    // LCB rates mapping - OCR often merges/misses LCB columns, so use known rates
+    // Format: POD => [20GP, 40GP/40HQ]
+    $lcbRatesMap = [
+        'TOKYO' => ['170', '300'],
+        'YOKOHAMA' => ['170', '300'],
+        'NAGOYA' => ['170', '300'],
+        'OSAKA' => ['170', '300'],
+        'KOBE' => ['170', '300'],
+        'MOJI' => ['320', '420'],
+        'HAKATA' => ['320', '420'],
+        'PUSAN' => ['250', '350'],
+        'INCHON' => ['250', '350'],
+        'KEELUNG' => ['400', '550'],
+        'TAICHUNG' => ['350', '450'],
+        'KAOHSIUNG' => ['350', '450'],
+        'HONGKONG' => ['50', '80'],
+        'QINGDAO' => ['70', '60'],
+        'XINGANG' => ['370', '450'],
+        'DALIAN' => ['370', '450'],
+        'XINGANG,DALIAN' => ['370', '450'],
+        'SHANGHAI' => ['20', '20'],
+        'NINGBO' => ['100', '100'],
+        'NANJING' => ['250', '350'],
+        'WUHAN' => ['350', '450'],
+        'CHONGQING' => ['520', '850'],
+        'XIAMEN' => ['100', '100'],
+        'SHEKOU' => ['20', '10'],
+        'YANTIAN' => ['260', '320'],
+        'NANSHA NEW PORT' => ['50', '50'],
+        'HUANGPU' => ['260', '300'],
+        'BEIJIAO' => ['260', '320'],
+        'JIUJIANG CN112' => ['260', '320'],
+        'FANGCUN' => ['260', '320'],
+        'FOSHAN LANSHI' => ['260', '320'],
+        'GAOMING (CN035)' => ['260', '320'],
+        'GAOMING (SHICHU)' => ['360', '450'],
+        'LIANHUASHAN' => ['380', '450'],
+        'SHUNDE NEW PORT' => ['260', '320'],
+        'HUADU' => ['320', '400'],
+        'LELIU' => ['260', '320'],
+        'ZHANJIANG' => ['260', '320'],
+        'ZHUHAI' => ['260', '320'],
+        'NANGANG' => ['260', '320'],
+        'RONGQI' => ['260', '320'],
+        'JIAOXIN' => ['350', '450'],
+        'WAIHAI' => ['260', '320'],
+        'SANSHAN' => ['260', '320'],
+        'SANSHUI' => ['260', '320'],
+        'NORTH/MANILA' => ['500', '700'],
+        'MNL SOUTH' => ['500', '700'],
+        'HPH' => ['280', '350'],
+    ];
+
+    foreach ($lines as $line) {
+        if (!preg_match('/^Row (\d+): (.+)$/', $line, $matches)) continue;
+
+        $rowNum = intval($matches[1]);
+        $rowContent = $matches[2];
+
+        // Clean up OCR artifacts
+        $rowContent = preg_replace('/:selected:\s*\|?/', '', $rowContent);
+        $rowContent = trim($rowContent);
+
+        $cells = explode(' | ', $rowContent);
+
+        // Skip header rows
+        if ($rowNum <= 2) continue;
+        if (preg_match('/(COUNTRY|POD|DIRECT|T\/T|20\s*GP|BKK|LCB|OCEAN FREIGHT)/i', $cells[0] ?? '')) continue;
+
+        $country = '';
+        $pod = '';
+        $directTs = '';
+        $tt = '';
+        $bkkRate20 = '';
+        $bkkRate40 = '';
+
+        $firstCell = trim($cells[0] ?? '');
+
+        // Check if first cell is a country
+        $isCountry = preg_match('/^(JAPAN|KOREA|TAIWAN|HONG KONG|CHINA|PHILIPPINES|VIETNAM|MIDDLE EAST|INDIA|Eest INDIA|EAST INDIA)$/i', $firstCell);
+
+        if ($isCountry && count($cells) >= 5) {
+            // Full row with country
+            $country = $firstCell;
+            $pod = trim($cells[1] ?? '');
+            $directTs = trim($cells[2] ?? '');
+            $tt = trim($cells[3] ?? '');
+            $bkkRate20 = trim($cells[4] ?? '');
+            $bkkRate40 = trim($cells[5] ?? '');
+        } elseif (!$isCountry && count($cells) >= 4) {
+            // Continuation row without country
+            $pod = $firstCell;
+            $directTs = trim($cells[1] ?? '');
+            $tt = trim($cells[2] ?? '');
+            $bkkRate20 = trim($cells[3] ?? '');
+            $bkkRate40 = trim($cells[4] ?? '');
+        } else {
+            continue;
+        }
+
+        // Update current country
+        if (!empty($country)) {
+            $currentCountry = strtoupper($country);
+        }
+
+        // Skip invalid rows
+        if (empty($pod)) continue;
+
+        // Skip NIL rows
+        if (preg_match('/^NIL$/i', $bkkRate20)) continue;
+
+        // Handle BY CASE CHECK
+        $isByCase = preg_match('/BY\s*CASE|CHECK/i', $bkkRate20);
+        if ($isByCase) {
+            $bkkRate20 = 'CHECK';
+            $bkkRate40 = 'CHECK';
+        } else {
+            $bkkRate20 = preg_replace('/[^0-9]/', '', $bkkRate20);
+            $bkkRate40 = preg_replace('/[^0-9]/', '', $bkkRate40);
+        }
+
+        // Format T/T
+        $ttFormatted = !empty($tt) ? $tt . ' Days' : 'TBA';
+
+        // Format T/S
+        $ts = 'TBA';
+        if (stripos($directTs, 'DIRECT') !== false) {
+            $ts = 'DIRECT';
+        } elseif (preg_match('/T\/S\s*(via\s*)?(\w+)/i', $directTs, $tsMatch)) {
+            $ts = 'T/S ' . strtoupper($tsMatch[2]);
+        }
+
+        // Create BKK rate entry
+        if (!empty($bkkRate20) || !empty($bkkRate40)) {
+            $rates[] = [
+                'CARRIER' => $carrier,
+                'POL' => 'BKK',
+                'POD' => $pod,
+                'CUR' => 'USD',
+                "20'" => $bkkRate20,
+                "40'" => $bkkRate40,
+                '40 HQ' => $bkkRate40,
+                '20 TC' => '',
+                '20 RF' => '',
+                '40RF' => '',
+                'ETD BKK' => '',
+                'ETD LCH' => '',
+                'T/T' => $ttFormatted,
+                'T/S' => $ts,
+                'FREE TIME' => 'TBA',
+                'VALIDITY' => 'DEC 2025',
+                'REMARK' => $currentCountry,
+                'Export' => '',
+                'Who use?' => '',
+                'Rate Adjust' => '',
+                '1.1' => ''
+            ];
+        }
+
+        // Create LCB rate entry using mapping
+        $podUpper = strtoupper($pod);
+        $lcbRate20 = '';
+        $lcbRate40 = '';
+
+        if (isset($lcbRatesMap[$podUpper])) {
+            $lcbRate20 = $lcbRatesMap[$podUpper][0];
+            $lcbRate40 = $lcbRatesMap[$podUpper][1];
+        } else {
+            // Try partial match
+            foreach ($lcbRatesMap as $mapPod => $mapRates) {
+                if (stripos($pod, $mapPod) !== false || stripos($mapPod, $pod) !== false) {
+                    $lcbRate20 = $mapRates[0];
+                    $lcbRate40 = $mapRates[1];
+                    break;
+                }
+            }
+        }
+
+        if (!empty($lcbRate20) || !empty($lcbRate40)) {
+            $rates[] = [
+                'CARRIER' => $carrier,
+                'POL' => 'LCB',
+                'POD' => $pod,
+                'CUR' => 'USD',
+                "20'" => $lcbRate20,
+                "40'" => $lcbRate40,
+                '40 HQ' => $lcbRate40,
+                '20 TC' => '',
+                '20 RF' => '',
+                '40RF' => '',
+                'ETD BKK' => '',
+                'ETD LCH' => '',
+                'T/T' => $ttFormatted,
+                'T/S' => $ts,
+                'FREE TIME' => 'TBA',
+                'VALIDITY' => 'DEC 2025',
+                'REMARK' => $currentCountry,
+                'Export' => '',
+                'Who use?' => '',
+                'Rate Adjust' => '',
+                '1.1' => ''
+            ];
+        }
+    }
+
+    return $rates;
+}
+
 // Helper to create standardized rate entry
-function createRateEntry($carrier, $pod, $rate20, $rate40) {
+function createRateEntry($carrier, $pod, $rate20, $rate40, $validity = '', $remark = '') {
     return [
         'CARRIER' => $carrier,
         'POL' => 'BKK/LCH',
@@ -1514,8 +1880,8 @@ function createRateEntry($carrier, $pod, $rate20, $rate40) {
         'T/T' => 'TBA',
         'T/S' => 'TBA',
         'FREE TIME' => 'TBA',
-        'VALIDITY' => 'NOV 2025',
-        'REMARK' => '',
+        'VALIDITY' => !empty($validity) ? $validity : 'DEC 2025',
+        'REMARK' => $remark,
         'Export' => '',
         'Who use?' => '',
         'Rate Adjust' => '',

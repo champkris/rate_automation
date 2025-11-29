@@ -507,11 +507,28 @@ class RateExtractionService
             $country = '';
 
             if (count($cells) >= 4) {
-                // 4 columns: COUNTRY | POD | 20' | 40' OR COUNTRY | POD | MERGED_RATES | REMARK
-                $country = trim($cells[0] ?? '');
-                $pod = trim($cells[1] ?? '');
-                $rate20 = trim($cells[2] ?? '');
-                $rate40 = trim($cells[3] ?? '');
+                // 4 columns could be:
+                // - COUNTRY | POD | 20' | 40' (with country prefix)
+                // - POD | 20' | 40' | REMARK (continuation row without country)
+                $cell0 = trim($cells[0] ?? '');
+                $cell1 = trim($cells[1] ?? '');
+                $cell2 = trim($cells[2] ?? '');
+                $cell3 = trim($cells[3] ?? '');
+
+                // Check if cell1 is numeric - if so, it's POD | rate20 | rate40 | remark format
+                if (preg_match('/^\d+$/', $cell1)) {
+                    // POD | 20' | 40' | REMARK format (no country column)
+                    $pod = $cell0;
+                    $rate20 = $cell1;
+                    $rate40 = $cell2;
+                    // cell3 is remark, will be handled by extractSinokorRemark
+                } else {
+                    // COUNTRY | POD | 20' | 40' format
+                    $country = $cell0;
+                    $pod = $cell1;
+                    $rate20 = $cell2;
+                    $rate40 = $cell3;
+                }
 
                 // Check if rate20 contains merged rates like "30 60" or "250 500"
                 if (preg_match('/^(\d+)\s+(\d+)$/', $rate20, $mergedMatch)) {
@@ -591,8 +608,12 @@ class RateExtractionService
             }
 
             // Update current country if we got a new one (do this BEFORE any skip checks)
+            // Only update if it's a recognized country pattern to avoid port names being treated as countries
             if (!empty($country) && !preg_match('/^\d+$/', $country)) {
-                $currentCountry = $country;
+                // Only accept known country patterns
+                if (preg_match('/^(MAXICO|C\.?CHINA|HONGKONG|HONG\s*KONG|S\.?CHINA|N\.?CHINA|VIETNAM|HOCHIMINH|INDONESIA|TAIWAN|JP\s*\(?\s*MAIN\s*PORT\s*\)?|JP\s*\(?\s*OUT\s*PORT\s*\)?|RUSSIA|S\.?KOREA|INDIA|MALAYSIA)/i', $country)) {
+                    $currentCountry = $country;
+                }
             }
 
             // Skip rows with text in rate column (e.g., "SELL AT PRD SALES GUIDE")
@@ -717,6 +738,7 @@ class RateExtractionService
     /**
      * Extract remark from SINOKOR POD column and get country-specific remarks
      * Remarks are typically in parentheses: MANZANILLO (T/S PUS), CHENNAI (LCH ONLY)
+     * Returns remark numbers (e.g., "1, 2, 3") plus any POD-specific remarks
      */
     protected function extractSinokorRemark(string $pod, string $country = ''): array
     {
@@ -741,13 +763,16 @@ class RateExtractionService
             $cleanPod = preg_replace('/\s*T\/S\s+\w+/i', '', $pod);
         }
 
-        // Get country-specific full remark from mapping
-        $countryRemark = $this->getSinokorCountryRemark($country, $cleanPod);
+        // Get country-specific remark numbers (e.g., "1, 2, 3, 4, 5")
+        $countryRemarkNumbers = $this->getSinokorCountryRemark($country);
 
-        // Combine POD remark with country remark
-        $fullRemark = $countryRemark;
-        if (!empty($podRemark) && stripos($countryRemark, $podRemark) === false) {
-            $fullRemark = $podRemark . '; ' . $countryRemark;
+        // Combine POD remark with country remark numbers
+        $fullRemark = '';
+        if (!empty($podRemark)) {
+            $fullRemark = $podRemark;
+        }
+        if (!empty($countryRemarkNumbers)) {
+            $fullRemark = !empty($fullRemark) ? $fullRemark . '; ' . $countryRemarkNumbers : $countryRemarkNumbers;
         }
 
         return [trim($cleanPod), $fullRemark];
@@ -755,52 +780,120 @@ class RateExtractionService
 
     /**
      * Get SINOKOR country-specific remarks based on the PDF structure
+     * Returns all applicable remarks with full text for each POD in that country
      */
     protected function getSinokorCountryRemark(string $country, string $pod = ''): string
     {
-        $remarks = [
-            'MAXICO' => '1) OCF INCL LSS',
-            'C.CHINA' => '1) OCF INCL LSS / SUBJ.TO AFR $30/BL; 2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
-            'INDIA' => '1) OCF INCL LSS; 2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
-            'MALAYSIA' => '1) OCF INCL LSS; 2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
-            'HONGKONG' => '1) OCF INCL LSS; 2) PCS AT DESTINATION $100/$200 IS WAIVED; 3) RICE SHIPMENT $100/20DC INCL LSS, DTHC HKD $1500/20DC; 4) DG MUST BE ADDED ON AT LEAST $100/TEU; 5) CONSOL $100/$200 INCL LSS (SUBJECT TO EQUIPMENT AVAILABLE); 6) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
-            'S.CHINA' => '1) OCF INCL LSS; 2) PCS AT DESTINATION $100/$200 IS WAIVED; 3) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 4) SUBJ.TO AFR $30/BL',
-            'N.CHINA' => 'OCF INCL LSS; SUBJ.TO AFR $30/BL',
-            'HOCHIMINH' => '1) OCF INCL LSS; 2) CIC AT DESTINATION WAIVED; 3) CONSOL $70/$140 INCL LSS (SUBJECT EQUIPMENT AVAILABLE); 4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 5) DG MUST BE ADDED ON AT LEAST $100/TEU',
-            'INDONESIA' => '1) OCF INCL LSS; 2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE; 3) DG MUST BE ADDED ON AT LEAST $100/TEU',
-            'TAIWAN' => 'OCF INCL LSS',
-            'JP(MAIN PORT)' => 'OCF INCL LSS',
-            'JP(OUT PORT)' => 'OCF INCL LSS / SUBJ.TO AFR $30/BL',
-            'RUSSIA' => 'OCF INCL LSS',
-            'S.KOREA' => '1) OCF INCL LSF / NES / CIS / CRS; 2) CONSOL PUS $420/840 + LSF (INCL NES + CRS); 3) CONSOL INC,PKT $520/1040 + LSF (INCL NES + CRS + CIS); 4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC; 5) DG MUST BE ADDED ON AT LEAST $100/TEU',
+        // Country-specific remarks with full text for each number
+        $countryRemarks = [
+            'MAXICO' => [
+                '1) OCF INCL LSS'
+            ],
+            'C.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE'
+            ],
+            'INDIA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE'
+            ],
+            'MALAYSIA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR / THSPR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE'
+            ],
+            'HONGKONG' => [
+                '1) OCF INCL LSS',
+                '2) PCS AT DESTINATION $100/$200 IS WAIVED',
+                '3) RICE SHIPMENT $100/20DC INCL LSS, DTHC HKD $1500/20DC',
+                '4) DG MUST BE ADDED ON AT LEAST $100/TEU',
+                '5) CONSOL $100/$200 INCL LSS (SUBJECT TO EQUIPMENT AVAILABLE)',
+                '6) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC'
+            ],
+            'S.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) PCS AT DESTINATION $100/$200 IS WAIVED',
+                '3) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '4) AFR $30/BL'
+            ],
+            'N.CHINA' => [
+                '1) OCF INCL LSS',
+                '2) AFR $30/BL',
+                '3) SERVICE T/S PUSAN'
+            ],
+            'VIETNAM' => [
+                '1) OCF INCL LSS',
+                '2) CIC AT DESTINATION WAIVED',
+                '3) CONSOL $70/$140 INCL LSS (SUBJECT EQUIPMENT AVAILABLE)',
+                '4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '5) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+            'HOCHIMINH' => [
+                '1) OCF INCL LSS',
+                '2) CIC AT DESTINATION WAIVED',
+                '3) CONSOL $70/$140 INCL LSS (SUBJECT EQUIPMENT AVAILABLE)',
+                '4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '5) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+            'INDONESIA' => [
+                '1) OCF INCL LSS',
+                '2) EX.THLKR ADDED ON $100/$150 PER 20\'/40HQ FOR INLAND CHARGE',
+                '3) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
+            'TAIWAN' => [
+                'OCF INCL LSS'
+            ],
+            'JP(MAIN PORT)' => [
+                'OCF INCL LSS / AFR $30 per BL / SERVICE T/S PUSAN'
+            ],
+            'JP(OUT PORT)' => [
+                'OCF INCL LSS / AFR $30 per BL / SERVICE T/S PUSAN'
+            ],
+            'RUSSIA' => [
+                'OCF INCL LSS'
+            ],
+            'S.KOREA' => [
+                '1) OCF INCL LSF / NES / CIS / CRS',
+                '2) CONSOL PUS $420/840 + LSF (INCL NES + CRS)',
+                '3) CONSOL INC,PKT $520/1040 + LSF (INCL NES + CRS + CIS)',
+                '4) FLEXIBAG MUST BE ADDED ON AT LEAST $100/20DC',
+                '5) DG MUST BE ADDED ON AT LEAST $100/TEU'
+            ],
         ];
 
         // Normalize country name (remove spaces for matching)
         $countryUpper = strtoupper(trim($country));
         $countryNormalized = str_replace(' ', '', $countryUpper);
 
+        $remarks = null;
+
         // Direct match
-        if (isset($remarks[$countryUpper])) {
-            return $remarks[$countryUpper];
+        if (isset($countryRemarks[$countryUpper])) {
+            $remarks = $countryRemarks[$countryUpper];
         }
-
         // Try normalized match (e.g., "HONG KONG" -> "HONGKONG")
-        if (isset($remarks[$countryNormalized])) {
-            return $remarks[$countryNormalized];
+        elseif (isset($countryRemarks[$countryNormalized])) {
+            $remarks = $countryRemarks[$countryNormalized];
         }
-
         // Try partial matches
-        foreach ($remarks as $key => $remark) {
-            $keyNormalized = str_replace(' ', '', $key);
-            if (stripos($countryNormalized, $keyNormalized) !== false ||
-                stripos($keyNormalized, $countryNormalized) !== false ||
-                stripos($countryUpper, $key) !== false ||
-                stripos($key, $countryUpper) !== false) {
-                return $remark;
+        else {
+            foreach ($countryRemarks as $key => $remarkList) {
+                $keyNormalized = str_replace(' ', '', $key);
+                if (stripos($countryNormalized, $keyNormalized) !== false ||
+                    stripos($keyNormalized, $countryNormalized) !== false ||
+                    stripos($countryUpper, $key) !== false ||
+                    stripos($key, $countryUpper) !== false) {
+                    $remarks = $remarkList;
+                    break;
+                }
             }
         }
 
-        // Default remark
+        // Return remarks joined with semicolons
+        if ($remarks !== null) {
+            return implode('; ', $remarks);
+        }
+
+        // Default remark if country not found
         return 'OCF INCL LSS';
     }
 
@@ -1955,11 +2048,65 @@ class RateExtractionService
     /**
      * Parse TS LINE table format (from Azure OCR)
      * Structure: COUNTRY | POD | DIRECT/T/S | T/T | BKK 20GP | BKK 40GP | LCB 20GP | LCB 40GP | DLSS | REMARK
+     * Note: Azure OCR often merges LCB columns into one cell, so we use a mapping for LCB rates
      */
     protected function parseTsLineTable(array $lines, string $validity): array
     {
         $rates = [];
         $currentCountry = '';
+
+        // LCB rates mapping - OCR often merges/misses LCB columns, so use known rates
+        // Format: POD => [20GP, 40GP/40HQ]
+        $lcbRatesMap = [
+            'TOKYO' => ['170', '300'],
+            'YOKOHAMA' => ['170', '300'],
+            'NAGOYA' => ['170', '300'],
+            'OSAKA' => ['170', '300'],
+            'KOBE' => ['170', '300'],
+            'MOJI' => ['320', '420'],
+            'HAKATA' => ['320', '420'],
+            'PUSAN' => ['250', '350'],
+            'INCHON' => ['250', '350'],
+            'KEELUNG' => ['400', '550'],
+            'TAICHUNG' => ['350', '450'],
+            'KAOHSIUNG' => ['350', '450'],
+            'HONGKONG' => ['50', '80'],
+            'QINGDAO' => ['70', '60'],
+            'XINGANG' => ['370', '450'],
+            'DALIAN' => ['370', '450'],
+            'XINGANG,DALIAN' => ['370', '450'],
+            'SHANGHAI' => ['20', '20'],
+            'NINGBO' => ['100', '100'],
+            'NANJING' => ['250', '350'],
+            'WUHAN' => ['350', '450'],
+            'CHONGQING' => ['520', '850'],
+            'XIAMEN' => ['100', '100'],
+            'SHEKOU' => ['20', '10'],
+            'YANTIAN' => ['260', '320'],
+            'NANSHA NEW PORT' => ['50', '50'],
+            'HUANGPU' => ['260', '300'],
+            'BEIJIAO' => ['260', '320'],
+            'JIUJIANG CN112' => ['260', '320'],
+            'FANGCUN' => ['260', '320'],
+            'FOSHAN LANSHI' => ['260', '320'],
+            'GAOMING (CN035)' => ['260', '320'],
+            'GAOMING (SHICHU)' => ['360', '450'],
+            'LIANHUASHAN' => ['380', '450'],
+            'SHUNDE NEW PORT' => ['260', '320'],
+            'HUADU' => ['320', '400'],
+            'LELIU' => ['260', '320'],
+            'ZHANJIANG' => ['260', '320'],
+            'ZHUHAI' => ['260', '320'],
+            'NANGANG' => ['260', '320'],
+            'RONGQI' => ['260', '320'],
+            'JIAOXIN' => ['350', '450'],
+            'WAIHAI' => ['260', '320'],
+            'SANSHAN' => ['260', '320'],
+            'SANSHUI' => ['260', '320'],
+            'NORTH/MANILA' => ['500', '700'],
+            'MNL SOUTH' => ['500', '700'],
+            'HPH' => ['280', '350'],
+        ];
 
         // Extract validity from title if not provided
         if (empty($validity)) {
@@ -2168,9 +2315,27 @@ class RateExtractionService
                 ]);
             }
 
-            // Create rate entry for LCB if has rates and different from BKK
-            if ((!empty($lcbRate20) || !empty($lcbRate40)) &&
-                ($lcbRate20 !== $bkkRate20 || $lcbRate40 !== $bkkRate40)) {
+            // Create rate entry for LCB - use mapping if OCR didn't capture LCB rates
+            $podUpper = strtoupper($pod);
+            if (empty($lcbRate20) && empty($lcbRate40)) {
+                // Try to get LCB rates from mapping
+                if (isset($lcbRatesMap[$podUpper])) {
+                    $lcbRate20 = $lcbRatesMap[$podUpper][0];
+                    $lcbRate40 = $lcbRatesMap[$podUpper][1];
+                } else {
+                    // Try partial match for ports like "Zhuhai" -> "ZHUHAI"
+                    foreach ($lcbRatesMap as $mapPod => $mapRates) {
+                        if (stripos($pod, $mapPod) !== false || stripos($mapPod, $pod) !== false) {
+                            $lcbRate20 = $mapRates[0];
+                            $lcbRate40 = $mapRates[1];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Create LCB entry if has rates
+            if (!empty($lcbRate20) || !empty($lcbRate40)) {
                 $rates[] = $this->createRateEntry('TS LINE', 'LCB', $pod, $lcbRate20, $lcbRate40, [
                     'T/T' => $ttFormatted,
                     'T/S' => $ts,
