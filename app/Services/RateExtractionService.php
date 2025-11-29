@@ -2106,6 +2106,10 @@ class RateExtractionService
             'NORTH/MANILA' => ['500', '700'],
             'MNL SOUTH' => ['500', '700'],
             'HPH' => ['280', '350'],
+            'MANZANILLO, MEXICO' => ['1300', '1400'],
+            'MANZANILLO' => ['1300', '1400'],
+            'LONG BEACH /LA' => ['CHECK', 'CHECK'],
+            'LONG BEACH' => ['CHECK', 'CHECK'],
         ];
 
         // Extract validity from title if not provided

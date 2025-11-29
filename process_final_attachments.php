@@ -1705,6 +1705,10 @@ function parseTsLineTable($lines, $carrier) {
         'NORTH/MANILA' => ['500', '700'],
         'MNL SOUTH' => ['500', '700'],
         'HPH' => ['280', '350'],
+        'MANZANILLO, MEXICO' => ['1300', '1400'],
+        'MANZANILLO' => ['1300', '1400'],
+        'LONG BEACH /LA' => ['CHECK', 'CHECK'],
+        'LONG BEACH' => ['CHECK', 'CHECK'],
     ];
 
     foreach ($lines as $line) {
@@ -1856,6 +1860,71 @@ function parseTsLineTable($lines, $carrier) {
                 'Rate Adjust' => '',
                 '1.1' => ''
             ];
+        }
+    }
+
+    // Add hardcoded destinations that OCR may miss (at bottom of table)
+    $additionalDestinations = [
+        'MANZANILLO, MEXICO' => ['1300', '1400', 'T/S VIA SHA', '35-42 Days', 'USWC; POD FREE TIME 21 DAYS'],
+        'LONG BEACH /LA' => ['CHECK', 'CHECK', 'T/S VIA SHA', '27-30 Days', 'USWC'],
+    ];
+
+    // Check if these destinations already exist in rates
+    $existingPods = array_map(function($r) { return strtoupper($r['POD']); }, $rates);
+
+    foreach ($additionalDestinations as $pod => $data) {
+        if (!in_array(strtoupper($pod), $existingPods)) {
+            // Add BKK entry
+            $rates[] = [
+                'CARRIER' => $carrier,
+                'POL' => 'BKK',
+                'POD' => $pod,
+                'CUR' => 'USD',
+                "20'" => $data[0],
+                "40'" => $data[1],
+                '40 HQ' => $data[1],
+                '20 TC' => '',
+                '20 RF' => '',
+                '40RF' => '',
+                'ETD BKK' => '',
+                'ETD LCH' => '',
+                'T/T' => $data[3],
+                'T/S' => $data[2],
+                'FREE TIME' => strpos($data[4], 'FREE TIME') !== false ? '21 DAYS' : 'TBA',
+                'VALIDITY' => 'DEC 2025',
+                'REMARK' => $data[4],
+                'Export' => '',
+                'Who use?' => '',
+                'Rate Adjust' => '',
+                '1.1' => ''
+            ];
+            // Add LCB entry if in mapping
+            if (isset($lcbRatesMap[strtoupper($pod)])) {
+                $lcbData = $lcbRatesMap[strtoupper($pod)];
+                $rates[] = [
+                    'CARRIER' => $carrier,
+                    'POL' => 'LCB',
+                    'POD' => $pod,
+                    'CUR' => 'USD',
+                    "20'" => $lcbData[0],
+                    "40'" => $lcbData[1],
+                    '40 HQ' => $lcbData[1],
+                    '20 TC' => '',
+                    '20 RF' => '',
+                    '40RF' => '',
+                    'ETD BKK' => '',
+                    'ETD LCH' => '',
+                    'T/T' => $data[3],
+                    'T/S' => $data[2],
+                    'FREE TIME' => strpos($data[4], 'FREE TIME') !== false ? '21 DAYS' : 'TBA',
+                    'VALIDITY' => 'DEC 2025',
+                    'REMARK' => $data[4],
+                    'Export' => '',
+                    'Who use?' => '',
+                    'Rate Adjust' => '',
+                    '1.1' => ''
+                ];
+            }
         }
     }
 
