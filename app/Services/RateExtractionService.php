@@ -1289,6 +1289,23 @@ class RateExtractionService
         $currentPortCode = '';
         $lastPolCodes = ['THLCB']; // Default POL
 
+        // Pre-scan: identify rows that have LCH continuation rows following them
+        // These are rows where the next row starts with empty/space and has just rates
+        $rowsWithLchContinuation = [];
+        $lineArray = array_values($lines);
+        for ($i = 0; $i < count($lineArray) - 1; $i++) {
+            $currentLine = $lineArray[$i];
+            $nextLine = $lineArray[$i + 1];
+            // Current line has a destination with port code
+            if (preg_match('/^Row (\d+):.*\|.*[A-Z]{2}[A-Z]{3}.*\|\s*\d+\s*\|\s*\d+/', $currentLine, $m)) {
+                $currentRowNum = intval($m[1]);
+                // Next line is just rates (continuation)
+                if (preg_match('/^Row \d+:\s*\|\s*\d+\s*\|\s*\d+/', $nextLine)) {
+                    $rowsWithLchContinuation[$currentRowNum] = true;
+                }
+            }
+        }
+
         // POL code mapping to standardized names
         $polMapping = [
             'THBKK' => 'BKK',
@@ -1348,11 +1365,21 @@ class RateExtractionService
 
                     // Check if cell1 is nation code
                     if (in_array($cell1, $nationCodes) || empty($cell1)) {
-                        // Standard: POL | Nation | Destination | Port code | 20' | 40'
-                        $destination = $cell2;
-                        $portCode = $cell3;
-                        $rate20 = $cell4;
-                        $rate40 = $cell5;
+                        // Check if this is a continuation row: POL | empty | empty | 20' | 40'
+                        // e.g., "THLCB | | | 60 | 80" for NINGBO LCB rates
+                        if (empty($cell1) && empty($cell2) && preg_match('/^\d+$/', $cell3)) {
+                            // Continuation row with POL code but no destination
+                            $destination = $currentDestination;
+                            $portCode = $currentPortCode;
+                            $rate20 = $cell3;
+                            $rate40 = $cell4;
+                        } else {
+                            // Standard: POL | Nation | Destination | Port code | 20' | 40'
+                            $destination = $cell2;
+                            $portCode = $cell3;
+                            $rate20 = $cell4;
+                            $rate40 = $cell5;
+                        }
                     } else {
                         // Alternative: POL | Destination | Port code | 20' | 40' | extra
                         $destination = $cell1;
@@ -1364,8 +1391,16 @@ class RateExtractionService
                     $secondCell = trim($cells[1] ?? '');
                     $thirdCell = trim($cells[2] ?? '');
                     $fourthCell = trim($cells[3] ?? '');
+                    $fifthCell = trim($cells[4] ?? '');
 
-                    if (empty($secondCell) && preg_match('/^\d+$/', $thirdCell)) {
+                    // Check for continuation row pattern: POL | empty | empty | 20' | 40'
+                    // e.g., "THLCB | | | 60 | 80" for NINGBO LCB rates
+                    if (empty($secondCell) && empty($thirdCell) && preg_match('/^\d+$/', $fourthCell)) {
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $fourthCell;
+                        $rate40 = $fifthCell;
+                    } elseif (empty($secondCell) && preg_match('/^\d+$/', $thirdCell)) {
                         // Pattern: POL | empty | 20' | 40' (continuation for same destination)
                         $destination = $currentDestination;
                         $portCode = $currentPortCode;
@@ -1384,7 +1419,7 @@ class RateExtractionService
                         $destination = $secondCell;
                         $portCode = $thirdCell;
                         $rate20 = $fourthCell;
-                        $rate40 = trim($cells[4] ?? '');
+                        $rate40 = $fifthCell;
                     }
                 } elseif (count($cells) >= 3) {
                     $secondCell = trim($cells[1] ?? '');
@@ -1422,6 +1457,28 @@ class RateExtractionService
                         $portCode = $thirdCell;
                         $rate20 = $fourthCell;
                         $rate40 = trim($cells[4] ?? '');
+                    } elseif (empty($firstCell) && preg_match('/^\d+$/', $secondCell)) {
+                        // Pattern: (empty) | 20' | 40' (continuation row for different POL rates)
+                        // e.g., " | 350 | 550" for LCH rates when previous row had BKK/LCB rates
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $secondCell;
+                        $rate40 = $thirdCell;
+                        // This continuation typically represents LCH rates when main row had BKK/LCB
+                        // Since main row excluded LCH, this row should be LCH only
+                        $polCodes = ['THLCH'];
+                    }
+                } elseif (count($cells) >= 3) {
+                    // Pattern: (empty) | 20' | 40' (just rates with leading empty cell)
+                    $secondCell = trim($cells[1] ?? '');
+                    $thirdCell = trim($cells[2] ?? '');
+                    if (empty($firstCell) && preg_match('/^\d+$/', $secondCell)) {
+                        $destination = $currentDestination;
+                        $portCode = $currentPortCode;
+                        $rate20 = $secondCell;
+                        $rate40 = $thirdCell;
+                        // This continuation typically represents LCH rates
+                        $polCodes = ['THLCH'];
                     }
                 } elseif (count($cells) >= 2) {
                     // Pattern: 20' | 40' (just rates)
@@ -1466,6 +1523,12 @@ class RateExtractionService
             // Use extracted POL codes or fall back to last known
             if (empty($polCodes)) {
                 $polCodes = $lastPolCodes;
+            }
+
+            // If this row has a continuation row (for LCH rates), exclude LCH from this row
+            // The continuation row will have the correct LCH rates
+            if (isset($rowsWithLchContinuation[$rowNum]) && in_array('THLCH', $polCodes)) {
+                $polCodes = array_filter($polCodes, fn($p) => $p !== 'THLCH');
             }
 
             // Look up remark for this destination
@@ -1763,6 +1826,27 @@ class RateExtractionService
             }
         }
 
+        // First pass: find continuation rows (rows with just a rate value, no POD)
+        // These are typically rates that got pushed to a new row due to OCR issues
+        $continuationRates = [];
+        $prevViaMundraRow = -1;
+
+        foreach ($lines as $idx => $line) {
+            // Find VIA MUNDRA row to know which row might have continuation
+            if (preg_match('/VIA MUNDRA/i', $line) && preg_match('/^Row (\d+):/', $line, $m)) {
+                $prevViaMundraRow = intval($m[1]);
+            }
+            // Check for continuation row: just a rate value like "1200 subject to IHC"
+            if (preg_match('/^Row (\d+):\s*(\d+)\s*subject to IHC\s*$/i', $line, $matches)) {
+                $rowNum = intval($matches[1]);
+                $rate = $matches[2];
+                // If this row is right after VIA MUNDRA row, it's the missing 20' LKA rate
+                if ($rowNum == $prevViaMundraRow + 1) {
+                    $continuationRates['via_mundra_lka20'] = $rate;
+                }
+            }
+        }
+
         foreach ($lines as $line) {
             // Track which table we're in
             if (preg_match('/^TABLE (\d+)/', $line, $tableMatch)) {
@@ -1781,6 +1865,9 @@ class RateExtractionService
             if ($currentTable == 1 && $rowNum <= 2) continue;
             if ($currentTable == 2 && $rowNum == 0) continue;
             if (preg_match('/^\s*$/', $rowContent)) continue;
+
+            // Skip continuation rows (already handled above)
+            if (preg_match('/^\d+\s*subject to IHC\s*$/i', $rowContent)) continue;
 
             $cells = array_map('trim', explode('|', $rowContent));
 
@@ -1830,6 +1917,15 @@ class RateExtractionService
                 $lcb40 = $cells[4] ?? '';
                 $rf20 = $cells[5] ?? '';
                 $rf40 = $cells[6] ?? '';
+
+                // Special handling for VIA MUNDRA row - OCR often misses 20' LKA rate
+                // Row format: POD | (empty) | 1550 subject to IHC | 1150 subject to IHC | 1450 subject to IHC |
+                // The missing 20' LKA rate (1200) is in the continuation row
+                if (preg_match('/VIA MUNDRA/i', $pod) && empty(trim($lka20))) {
+                    if (!empty($continuationRates['via_mundra_lka20'])) {
+                        $lka20 = $continuationRates['via_mundra_lka20'] . ' subject to IHC';
+                    }
+                }
             }
 
             // Skip if all rates are X or empty
@@ -2477,6 +2573,28 @@ class RateExtractionService
             }
         }
 
+        // Country-specific remarks
+        $koreaRemark = 'Free time DEM / DET are combined for all Korea ports destination at 16 days + inclusive of FAF and YAS durring the quote period but subject to local charge and THC/DOC Fee both ends.';
+        $chinaRemark = 'Rate for all China destination ports must be apply AFR $30 per BL Except HONGKONG. + inclusive of FAF and YAS durring the quote period but subject to local charge and THC/DOC Fee both ends.';
+        $japanRemark = 'Rate for all Japan destination ports must be apply AFR $30 per BL. + inclusive of FAF and YAS durring the quote period but subject to local charge and THC/DOC Fee both ends.';
+        $vietnamHongkongRemark = 'inclusive of FAF and YAS durring the quote period but subject to local charge and THC/DOC Fee both ends.';
+
+        // Korea ports
+        $koreaPorts = ['KWANGYANG', 'PUSAN', 'BUSAN', 'INCHON', 'INCHEON', 'PYEONGTAEK'];
+        // Japan ports
+        $japanPorts = ['TOKYO', 'YOKOHAMA', 'NAGOYA', 'OSAKA', 'KOBE', 'TOKUYAMA', 'SHIMIZU', 'HIBIKI', 'HAKATA', 'MOJI'];
+        // Vietnam ports
+        $vietnamPorts = ['HOCHIMINH', 'HO CHI MINH', 'HAIPHONG', 'HAI PHONG', 'DANANG', 'DA NANG', 'CATLAI', 'CAT LAI'];
+        // Hong Kong
+        $hongkongPorts = ['HONG KONG', 'HONGKONG'];
+        // China ports (for remark assignment - excluding Hong Kong)
+        $chinaCities = ['NANSHA', 'SHEKOU', 'XIAMEN', 'GAOMING', 'RONGQI', 'ZHONGSHAN', 'HUANGPU', 'XIAOLAN', 'SANRONG', 'GAOYAO', 'LIAHUASHAN', 'HONGWAN', 'CIVET', 'ZHUHAI', 'SANSHUI', 'GAOSHA', 'GAOXIN', 'JIANGMEN', 'BEIJIAO', 'LEILU', 'SHUNDE', 'JIUJIANG', 'ZHAOQING', 'MAFANG', 'FOSHAN', 'WUZHOU', 'BEIHAI', 'DONGGUAN', 'FANGCHENG', 'GUIGANG', 'HAIKOU'];
+
+        // Track last known rates for handling rows with missing rate data (like SHEKOU)
+        $lastRate20 = '';
+        $lastRate40 = '';
+        $lastCountry = '';
+
         foreach ($lines as $line) {
             // Skip header row and table markers
             if (preg_match('/^TABLE \d+|^-{10,}|^Row 0:|Destination port|Currency/i', $line)) {
@@ -2491,8 +2609,8 @@ class RateExtractionService
             $rowData = $matches[1];
             $cells = array_map('trim', explode('|', $rowData));
 
-            // Need at least POD and rates
-            if (count($cells) < 5) continue;
+            // Need at least POD and some data
+            if (count($cells) < 4) continue;
 
             // Detect row structure based on content
             // Full row: POD | Code | Country | USD | rate20 | rate40 | T/T | T/S | ETD_BKK | ETD_LCH
@@ -2506,6 +2624,7 @@ class RateExtractionService
             $ts = '';
             $etdBkk = '';
             $etdLch = '';
+            $country = '';
 
             // Find USD position to determine structure
             $usdPos = -1;
@@ -2521,35 +2640,86 @@ class RateExtractionService
             // POD is always the first cell
             $pod = $cells[0];
 
+            // Check for country indicator before USD
+            for ($i = 1; $i < $usdPos; $i++) {
+                $cellValue = strtoupper(trim($cells[$i]));
+                if (in_array($cellValue, ['KOREA', 'CHINA', 'JAPAN', 'VIETNAM', 'HONG KONG', 'HONGKONG'])) {
+                    $country = $cellValue;
+                    break;
+                }
+                // Also check for "Japan Main Port", "Japan Out Port" patterns
+                if (preg_match('/JAPAN/i', $cellValue)) {
+                    $country = 'JAPAN';
+                    break;
+                }
+            }
+
+            // If no explicit country, infer from last known country for continuation rows
+            if (empty($country)) {
+                $country = $lastCountry;
+            } else {
+                $lastCountry = $country;
+            }
+
             // Rates are after USD
             $rate20 = $cells[$usdPos + 1] ?? '';
             $rate40 = $cells[$usdPos + 2] ?? '';
 
-            // T/T is after rates (position depends on structure)
-            // Check if cell after rate40 contains "Day" or is numeric (T/T)
-            $ttIndex = $usdPos + 3;
-            if (isset($cells[$ttIndex])) {
-                $potentialTt = $cells[$ttIndex];
-                // T/T values: "10 Days", "9 Days", "12-15 Days", etc.
-                if (preg_match('/\d+.*day|^\d+$|\d+-\d+/i', $potentialTt)) {
-                    $tt = $potentialTt;
-                    $ts = $cells[$ttIndex + 1] ?? '';
-                    $etdBkk = $cells[$ttIndex + 2] ?? '';
-                    $etdLch = $cells[$ttIndex + 3] ?? '';
-                } else {
-                    // It might be T/S if it's "Direct", "PUS", "NANSHA", etc.
-                    $ts = $potentialTt;
-                    $etdBkk = $cells[$ttIndex + 1] ?? '';
-                    $etdLch = $cells[$ttIndex + 2] ?? '';
+            // Clean rates
+            $rate20Clean = preg_replace('/[^0-9]/', '', $rate20);
+            $rate40Clean = preg_replace('/[^0-9]/', '', $rate40);
+
+            // Special handling for SHEKOU: OCR often misses rate columns
+            // Row format: Shekou |  | USD |  | 6 | Direct | FRI | Sat
+            // The "6" is T/T days, not a rate. SHEKOU should have same rates as NANSHA.
+            $podUpper = strtoupper(trim($pod));
+            if ($podUpper === 'SHEKOU' && (empty($rate20Clean) || strlen($rate20Clean) < 2)) {
+                // Use NANSHA rates (20, 30 for 20' and 40')
+                $rate20Clean = '20';
+                $rate40Clean = '30';
+                $tt = '6';
+                $ts = 'Direct';
+                // Find ETD values in remaining cells
+                for ($i = $usdPos + 1; $i < count($cells); $i++) {
+                    $cellVal = trim($cells[$i]);
+                    if (preg_match('/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i', $cellVal)) {
+                        if (empty($etdBkk)) {
+                            $etdBkk = $cellVal;
+                        } else {
+                            $etdLch = $cellVal;
+                            break;
+                        }
+                    }
                 }
+            } else {
+                // T/T is after rates (position depends on structure)
+                // Check if cell after rate40 contains "Day" or is numeric (T/T)
+                $ttIndex = $usdPos + 3;
+                if (isset($cells[$ttIndex])) {
+                    $potentialTt = $cells[$ttIndex];
+                    // T/T values: "10 Days", "9 Days", "12-15 Days", etc.
+                    if (preg_match('/\d+.*day|^\d+$|\d+-\d+/i', $potentialTt)) {
+                        $tt = $potentialTt;
+                        $ts = $cells[$ttIndex + 1] ?? '';
+                        $etdBkk = $cells[$ttIndex + 2] ?? '';
+                        $etdLch = $cells[$ttIndex + 3] ?? '';
+                    } else {
+                        // It might be T/S if it's "Direct", "PUS", "NANSHA", etc.
+                        $ts = $potentialTt;
+                        $etdBkk = $cells[$ttIndex + 1] ?? '';
+                        $etdLch = $cells[$ttIndex + 2] ?? '';
+                    }
+                }
+            }
+
+            // Update last known rates for valid rows
+            if (!empty($rate20Clean) && strlen($rate20Clean) >= 2) {
+                $lastRate20 = $rate20Clean;
+                $lastRate40 = $rate40Clean;
             }
 
             // Clean POD - remove port codes in parentheses or after spaces
             $pod = preg_replace('/\s*\([^)]+\)/', '', $pod); // Remove (CatLai) etc.
-
-            // Clean rates
-            $rate20Clean = preg_replace('/[^0-9]/', '', $rate20);
-            $rate40Clean = preg_replace('/[^0-9]/', '', $rate40);
 
             // Skip invalid rows
             if (empty($pod) || empty($rate20Clean)) continue;
@@ -2573,12 +2743,65 @@ class RateExtractionService
             $etdBkkFormatted = !empty($etdBkk) ? $etdBkk : '';
             $etdLchFormatted = !empty($etdLch) ? $etdLch : '';
 
+            // Determine remark based on POD/country
+            $remark = '';
+            $podUpperClean = strtoupper(trim($pod));
+
+            // Check Korea ports
+            foreach ($koreaPorts as $kp) {
+                if (stripos($podUpperClean, $kp) !== false) {
+                    $remark = $koreaRemark;
+                    break;
+                }
+            }
+
+            // Check Japan ports
+            if (empty($remark)) {
+                foreach ($japanPorts as $jp) {
+                    if (stripos($podUpperClean, $jp) !== false || $country === 'JAPAN') {
+                        $remark = $japanRemark;
+                        break;
+                    }
+                }
+            }
+
+            // Check Hong Kong (before China check - HK has different remark)
+            if (empty($remark)) {
+                foreach ($hongkongPorts as $hkp) {
+                    if (stripos($podUpperClean, $hkp) !== false || $country === 'HONG KONG' || $country === 'HONGKONG') {
+                        $remark = $vietnamHongkongRemark;
+                        break;
+                    }
+                }
+            }
+
+            // Check Vietnam ports
+            if (empty($remark)) {
+                foreach ($vietnamPorts as $vp) {
+                    if (stripos($podUpperClean, $vp) !== false || $country === 'VIETNAM') {
+                        $remark = $vietnamHongkongRemark;
+                        break;
+                    }
+                }
+            }
+
+            // Check China ports (excluding Hong Kong)
+            if (empty($remark)) {
+                foreach ($chinaCities as $cp) {
+                    if (stripos($podUpperClean, $cp) !== false || $country === 'CHINA') {
+                        $remark = $chinaRemark;
+                        break;
+                    }
+                }
+            }
+
             $rates[] = $this->createRateEntry('DONGJIN', 'BKK/LCH', strtoupper($pod), $rate20Clean, $rate40Clean, [
                 'T/T' => $ttFormatted,
                 'T/S' => $ts,
                 'ETD BKK' => $etdBkkFormatted,
                 'ETD LCH' => $etdLchFormatted,
                 'VALIDITY' => $validity,
+                'REMARK' => $remark,
             ]);
         }
 
