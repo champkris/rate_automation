@@ -94,6 +94,11 @@ class RateExtractionService
     {
         $content = implode("\n", array_slice($lines, 0, 30)); // Check first 30 lines
 
+        // SITC signature: "Service Route" column header or SITC service codes (VTX, CKV, JTH)
+        if (preg_match('/Service Route/i', $content) || preg_match('/\b(VTX\d|CKV\d|JTH)\b/i', $content)) {
+            return 'sitc';
+        }
+
         // SM LINE signature: "BANGKOK (UNITHAI)" and "LAEMCHABANG" in headers
         if (preg_match('/BANGKOK.*UNITHAI/i', $content) && preg_match('/LAEMCHABANG/i', $content)) {
             return 'sm_line';
@@ -1162,12 +1167,86 @@ class RateExtractionService
             }
         }
 
+        // Pre-process TABLE 2 to propagate merged cell values
+        // Surcharge and Free time columns have DIFFERENT merge lengths - track independently
+        // Free time can span multiple surcharge blocks
+        $lastValidSurcharge = '';
+        $lastValidFreeTime = '';
+        $processedTable2 = [];
+
+        foreach ($table2Data as $rowNum => $t2row) {
+            $col0 = trim($t2row[0] ?? '');
+            $col1 = trim($t2row[1] ?? '');
+            $col2 = trim($t2row[2] ?? '');
+            $col3 = trim($t2row[3] ?? '');
+
+            // Check if col0 has a full surcharge text (not just a number)
+            $hasFullSurcharge = !preg_match('/^\d+(-\d+)?$/', $col0) && !empty($col0)
+                && stripos($col0, 'surcharge') === false && stripos($col0, 'Dem /Det') === false;
+
+            // Check if this row has NEW free time data (in col3 or col2)
+            // Free time appears in col3 for full rows, or col2 for some continuation rows
+            $hasNewFreeTime = false;
+            $currentFreeTime = '';
+            if (!empty($col3) && preg_match('/day/i', $col3)) {
+                // Free time in col3 (standard position)
+                $hasNewFreeTime = true;
+                $currentFreeTime = $col3;
+            } elseif (!$hasFullSurcharge && preg_match('/day|det/i', $col2)) {
+                // Free time in col2 only for continuation rows (where col0 is T/T, col1 is T/S)
+                $hasNewFreeTime = true;
+                $currentFreeTime = $col2;
+            }
+
+            // Update surcharge tracking
+            if ($hasFullSurcharge) {
+                $lastValidSurcharge = $col0;
+            }
+
+            // Update free time tracking - propagates until a new free time value is found
+            if ($hasNewFreeTime) {
+                $lastValidFreeTime = $currentFreeTime;
+            }
+
+            // Determine T/T and T/S based on row type
+            $tt = '';
+            $ts = '';
+            if ($hasFullSurcharge) {
+                // Full row: col0=surcharge, col1=T/T, col2=T/S (or free time if col3 empty)
+                $tt = $col1;
+                // T/S is in col2 only if it doesn't contain free time text
+                if (!preg_match('/day|det/i', $col2)) {
+                    $ts = $col2;
+                }
+            } else {
+                // Continuation row: col0=T/T, col1=T/S
+                $tt = $col0;
+                // T/S is in col1 only if it doesn't contain free time text
+                if (!preg_match('/day|det/i', $col1)) {
+                    $ts = $col1;
+                }
+            }
+
+            $processedTable2[$rowNum] = [
+                'surcharge' => $lastValidSurcharge,
+                'tt' => $tt,
+                'ts' => $ts,
+                'freetime' => $lastValidFreeTime,
+            ];
+        }
+
         // Second pass: process table data
         foreach ($table1Data as $rowKey => $cells) {
             if (preg_match('/(POL|POD|Service Route|FREIGHT RATE)/i', $cells[0] ?? '')) continue;
 
             $pol = trim($cells[0] ?? '');
             if (empty($pol)) continue;
+
+            // Skip non-rate rows (metadata/notes rows from side tables)
+            // These typically have remarks text as POL instead of actual port names
+            if (preg_match('/^(Please recheck|Include LSS|INC LSS|no have LSS|^\d+$|^\d+-\d+$)/i', $pol)) continue;
+            // Skip rows where POL contains surcharge terms (these are note rows)
+            if (preg_match('/(LSS|CIC|ISPS|BDTHC|BDCFS|detention|dem\s*\/|det\s*$)/i', $pol)) continue;
 
             $col1 = trim($cells[1] ?? '');
             $pod = '';
@@ -1190,17 +1269,46 @@ class RateExtractionService
             $col2 = trim($cells[2] ?? '');
             $col3 = trim($cells[3] ?? '');
             $col4 = trim($cells[4] ?? '');
+            $col5 = trim($cells[5] ?? ''); // Other surcharge/condition column
 
             // Check if col2 is numeric (a rate) or text (a service code/POD)
             $col2IsNumeric = is_numeric(str_replace(',', '', $col2));
             $col3IsNumeric = is_numeric(str_replace(',', '', $col3));
+            $col1IsServiceCode = $isServiceCode($col1);
 
-            if (count($cells) >= 7 && $col3IsNumeric) {
-                // Full row with many columns: POL | POD | Service | 20' | 40' | ...
+            $surcharge = ''; // Will hold the "Other surcharge/condition" value
+
+            // Get surcharge, T/T, T/S, Free time from pre-processed TABLE 2
+            $table2Surcharge = '';
+            $table2TT = '';
+            $table2TS = '';
+            $table2FreeTime = '';
+            if (is_numeric($rowKey) && isset($processedTable2[$rowKey])) {
+                $t2processed = $processedTable2[$rowKey];
+                $table2Surcharge = $t2processed['surcharge'] ?? '';
+                $table2TT = $t2processed['tt'] ?? '';
+                $table2TS = $t2processed['ts'] ?? '';
+                $table2FreeTime = $t2processed['freetime'] ?? '';
+            }
+
+            // Check for continuation row with service code FIRST (before full row check)
+            // Pattern: POL | Service | 20' | 40' | ... (e.g., "LKB/Sahathai/TPT | VTX1 | 430 | 750")
+            if ($col1IsServiceCode && $col2IsNumeric) {
+                // Continuation row with service code
+                // POD should be inherited from previous row
+                $pod = $lastPod;
+                $serviceRoute = $col1; // The service code
+                $rate20 = str_replace(',', '', $col2);
+                $rate40 = str_replace(',', '', $col3);
+                $surcharge = $table2Surcharge ?: $col4; // Prefer TABLE 2, fallback to cell
+                $lastServiceRoute = $serviceRoute;
+            } elseif (count($cells) >= 7 && $col3IsNumeric && !$col1IsServiceCode) {
+                // Full row with many columns: POL | POD | Service | 20' | 40' | Surcharge | ...
                 $pod = $col1;
                 $serviceRoute = $col2;
                 $rate20 = str_replace(',', '', $col3);
                 $rate40 = str_replace(',', '', $col4);
+                $surcharge = $table2Surcharge ?: $col5; // Prefer TABLE 2, fallback to cell
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             } elseif (is_numeric(str_replace(',', '', $col1))) {
@@ -1209,6 +1317,7 @@ class RateExtractionService
                 $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col1);
                 $rate40 = str_replace(',', '', $col2);
+                $surcharge = $table2Surcharge ?: $col3; // Prefer TABLE 2, fallback to cell
             } elseif ($col2IsNumeric && !empty($col1)) {
                 // 4-column format without service: POL | POD | 20' | 40'
                 // col1 is POD, col2 is rate20, col3 is rate40
@@ -1216,13 +1325,15 @@ class RateExtractionService
                 $serviceRoute = $lastServiceRoute; // Inherit service from previous row
                 $rate20 = str_replace(',', '', $col2);
                 $rate40 = str_replace(',', '', $col3);
+                $surcharge = $table2Surcharge ?: $col4; // Prefer TABLE 2, fallback to cell
                 $lastPod = $pod;
             } elseif ($isServiceCode($col2) || (!$col2IsNumeric && $col3IsNumeric)) {
-                // 5-column format with service: POL | POD | Service | 20' | 40'
+                // 5-column format with service: POL | POD | Service | 20' | 40' | Surcharge
                 $pod = $col1;
                 $serviceRoute = $col2;
                 $rate20 = str_replace(',', '', $col3);
                 $rate40 = str_replace(',', '', $col4);
+                $surcharge = $table2Surcharge ?: $col5; // Prefer TABLE 2, fallback to cell
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             } else {
@@ -1231,18 +1342,37 @@ class RateExtractionService
                 $serviceRoute = $col2;
                 $rate20 = str_replace(',', '', $col3);
                 $rate40 = str_replace(',', '', $col4);
+                $surcharge = $table2Surcharge ?: $col5;
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             }
 
             if (empty($pod) || (empty($rate20) && empty($rate40))) continue;
 
+            // Use TABLE 2 values for T/T, T/S, Free time if available
+            if (!empty($table2TT)) {
+                $tt = $table2TT;
+            }
+            if (!empty($table2TS)) {
+                $ts = $table2TS;
+            }
+            if (!empty($table2FreeTime)) {
+                $freeTime = $table2FreeTime;
+            }
+
+            // Build remark: service route + surcharge if available
+            // Skip surcharge values that are just numbers (T/T, days, etc.) or T/S notes
+            $remark = $serviceRoute;
+            if (!empty($surcharge) && !preg_match('/^\d+(-\d+)?$/', $surcharge) && !preg_match('/^T\/S/i', $surcharge) && !preg_match('/^Please recheck/i', $surcharge)) {
+                $remark = $serviceRoute . ($serviceRoute ? ' - ' : '') . $surcharge;
+            }
+
             $rates[] = $this->createRateEntry('SITC', $pol, $pod, $rate20, $rate40, [
                 'T/T' => $tt,
                 'T/S' => $ts,
                 'FREE TIME' => $freeTime,
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                'REMARK' => $serviceRoute,
+                'REMARK' => $remark,
             ]);
         }
 

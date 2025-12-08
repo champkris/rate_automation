@@ -251,18 +251,27 @@ class RateExtractionController extends Controller
         if ($pattern === 'auto') {
             $filename = strtoupper($originalFilename);
 
-            // Check SKR pattern before generic SINOKOR
+            // Check specific carrier names FIRST (before generic patterns like FAK RATE)
+            // Order matters: more specific patterns before generic ones
             if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) {
                 return 'SINOKOR_SKR';
             }
             if (preg_match('/SINOKOR/i', $filename)) return 'SINOKOR';
-            if (preg_match('/FAK.?RATE/i', $filename)) return 'RCL';
-            if (preg_match('/UPDATED.?RATE/i', $filename)) return 'KMTC';
+            if (preg_match('/WANHAI|INDIA/i', $filename)) return 'WANHAI';
             if (preg_match('/HEUNG.?A|HUANG.?A/i', $filename)) return 'HEUNG_A';
             if (preg_match('/BOXMAN/i', $filename)) return 'BOXMAN';
             if (preg_match('/SITC/i', $filename)) return 'SITC';
-            if (preg_match('/INDIA|WANHAI/i', $filename)) return 'WANHAI';
             if (preg_match('/T\.?S\.?\s*LINE|RATE.?1ST/i', $filename)) return 'TS_LINE';
+            if (preg_match('/CK\s*LINE/i', $filename)) return 'CK_LINE';
+            if (preg_match('/SM\s*LINE/i', $filename)) return 'SM_LINE';
+            if (preg_match('/DONGJIN/i', $filename)) return 'DONGJIN';
+
+            // Generic patterns (should be checked AFTER specific carrier names)
+            if (preg_match('/UPDATED.?RATE/i', $filename)) return 'KMTC';
+            // "FAK Rate (ASIA)" is WANHAI - check before generic FAK RATE
+            if (preg_match('/FAK.?RATE.*\(?ASIA\)?/i', $filename)) return 'WANHAI';
+            // "FAK Rate" without a specific carrier is RCL
+            if (preg_match('/FAK.?RATE/i', $filename)) return 'RCL';
 
             // Fall back to carrier from rates
             return $this->getPrimaryCarrier($rates);
