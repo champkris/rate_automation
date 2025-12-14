@@ -1342,8 +1342,9 @@ class RateExtractionService
                 // Determine start index based on row type:
                 // - Full row: POL | POD | Service | 20' | 40' | T/T... → start at 5
                 // - Continuation row: POL | 20' | 40' | T/T... → start at 3
-                $isContinuationRow = ($pod === $lastPod) ||
-                    ($isPureRate($col1) && $isPureRate($col2)) ||
+                // Note: We check the actual row structure, not $pod === $lastPod, because
+                // $lastPod was already updated by the rate extraction branch above.
+                $isContinuationRow = ($isPureRate($col1) && $isPureRate($col2)) ||
                     ($col1IsServiceCode && $col2IsNumeric);
                 $startIdx = $isContinuationRow ? 3 : 5;
 
