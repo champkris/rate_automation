@@ -1144,6 +1144,13 @@ class RateExtractionService
         $lastPod = '';
         $lastServiceRoute = '';
         $lastFreeTime = 'TBA';
+        $lastTT = 'TBA';
+        $lastTS = 'TBA';
+
+        // Tables that contain T/T, T/S, Free time metadata (not rate data)
+        // TABLE 7 pairs with TABLE 5+6, TABLE 9 pairs with TABLE 8
+        $metadataTables = [7, 9];
+        $tableMetadata = []; // Store metadata tables keyed by table number and row
 
         // First pass: organize by table
         foreach ($lines as $line) {
@@ -1161,6 +1168,9 @@ class RateExtractionService
                 $table1Data[$rowNum] = $cells;
             } elseif ($currentTable == 2) {
                 $table2Data[$rowNum] = $cells;
+            } elseif (in_array($currentTable, $metadataTables)) {
+                // Store metadata tables separately
+                $tableMetadata[$currentTable][$rowNum] = $cells;
             } elseif ($currentTable >= 3) {
                 $uniqueKey = 'T' . $currentTable . '_R' . $rowNum;
                 $table1Data[$uniqueKey] = $cells;
@@ -1278,11 +1288,13 @@ class RateExtractionService
 
             $surcharge = ''; // Will hold the "Other surcharge/condition" value
 
-            // Get surcharge, T/T, T/S, Free time from pre-processed TABLE 2
+            // Get surcharge, T/T, T/S, Free time from pre-processed TABLE 2 (for TABLE 1 rows only)
             $table2Surcharge = '';
             $table2TT = '';
             $table2TS = '';
             $table2FreeTime = '';
+            $isTable3Plus = !is_numeric($rowKey); // TABLE 3+ rows have keys like T3_R0, T4_R1, etc.
+
             if (is_numeric($rowKey) && isset($processedTable2[$rowKey])) {
                 $t2processed = $processedTable2[$rowKey];
                 $table2Surcharge = $t2processed['surcharge'] ?? '';
@@ -1349,7 +1361,7 @@ class RateExtractionService
 
             if (empty($pod) || (empty($rate20) && empty($rate40))) continue;
 
-            // Use TABLE 2 values for T/T, T/S, Free time if available
+            // Use TABLE 2 values for T/T, T/S, Free time if available (TABLE 1 rows)
             if (!empty($table2TT)) {
                 $tt = $table2TT;
             }
@@ -1358,6 +1370,116 @@ class RateExtractionService
             }
             if (!empty($table2FreeTime)) {
                 $freeTime = $table2FreeTime;
+            }
+
+            // For TABLE 3+ rows, extract T/T, T/S, Free time from inline columns or paired metadata table
+            // TABLE 3/4 have 9-10 columns: POL | POD | Service | 20' | 40' | Reefer | Surcharge | T/T | T/S | Free time
+            // TABLE 5/6 have 5 columns: POL | POD | Service | 20' | 40' - metadata in TABLE 7
+            // TABLE 8 has 5 columns: POL | POD | Service | 20' | 40' - metadata in TABLE 9
+            if ($isTable3Plus) {
+                $numCells = count($cells);
+
+                // Determine which metadata table to use based on source table
+                // Parse table number from key like "T5_R20"
+                $sourceTable = 0;
+                $sourceRow = 0;
+                if (preg_match('/^T(\d+)_R(\d+)$/', $rowKey, $keyMatch)) {
+                    $sourceTable = intval($keyMatch[1]);
+                    $sourceRow = intval($keyMatch[2]);
+                }
+
+                // For TABLE 5/6, use TABLE 7 metadata; for TABLE 8, use TABLE 9 metadata
+                $metaTable = null;
+                if ($sourceTable == 5 || $sourceTable == 6) {
+                    $metaTable = 7;
+                    // TABLE 5 rows 0-35 map to TABLE 7 rows 0-35
+                    // TABLE 6 rows 0-37 map to TABLE 7 rows (cumulative after TABLE 5)
+                    // Actually looking at the data, TABLE 7 seems to be paired by row number with TABLE 5+6 sequentially
+                    // TABLE 5 has 36 rows, TABLE 6 has 38 rows, TABLE 7 has 38 rows
+                    // Let's use direct row mapping within each source table
+                } elseif ($sourceTable == 8) {
+                    $metaTable = 9;
+                }
+
+                // TABLE 4 has merged Free time columns not captured by OCR
+                // Rows 0-15 (N.MANILA to DAVAO): 7/4 days (dem+detention)
+                // Rows 16-17 (Kuantan): 5/5 days (dem+detention)
+                // Rows 19-20 (Kota kinabalu): 7/5 days (dem+detention)
+                if ($sourceTable == 4) {
+                    if ($sourceRow <= 15) {
+                        $freeTime = '7/4 days (dem+detention)';
+                    } elseif ($sourceRow >= 16 && $sourceRow <= 17) {
+                        $freeTime = '5/5 days (dem+detention)';
+                    } elseif ($sourceRow >= 19 && $sourceRow <= 20) {
+                        $freeTime = '7/5 days (dem+detention)';
+                    }
+                }
+
+                // Try to get metadata from the paired table first
+                if ($metaTable && isset($tableMetadata[$metaTable][$sourceRow])) {
+                    $metaCells = $tableMetadata[$metaTable][$sourceRow];
+                    // Extract T/T, T/S, Free time from metadata cells
+                    foreach ($metaCells as $cellVal) {
+                        $cellVal = trim($cellVal);
+                        if (empty($cellVal)) continue;
+
+                        // Free time pattern
+                        if ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+/i', $cellVal)) {
+                            $freeTime = $cellVal;
+                        }
+                        // T/S pattern
+                        elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                            $ts = $cellVal;
+                        }
+                        // T/T pattern (number or number-number)
+                        elseif ($tt === 'TBA' && preg_match('/^\d+(-\d+)?$/', $cellVal)) {
+                            $tt = $cellVal;
+                        }
+                    }
+                }
+
+                // If metadata not found, try inline columns (for TABLE 3/4 which have inline data)
+                if ($tt === 'TBA' || $ts === 'TBA' || $freeTime === 'TBA') {
+                    // For rows with enough columns (full rows and continuation rows)
+                    // Scan all cells after the rate columns to find T/T, T/S, Free time
+                    $startIdx = ($numCells >= 8) ? 5 : 3; // Start after rates
+
+                    for ($i = $numCells - 1; $i >= $startIdx; $i--) {
+                        $cellVal = trim($cells[$i] ?? '');
+                        if (empty($cellVal)) continue;
+
+                        // Free time pattern: "X days" or "X/Y days" or "X days detention" or "X dem/ Y det"
+                        if ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+/i', $cellVal)) {
+                            $freeTime = $cellVal;
+                        }
+                        // T/S pattern: "Direct", "T/S XXX", "T/S at XXX"
+                        elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                            $ts = $cellVal;
+                        }
+                        // T/T pattern: number or number-number (transit days) - but not dates like "09-Oct"
+                        elseif ($tt === 'TBA' && preg_match('/^\d+(-\d+)?$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
+                            $tt = $cellVal;
+                        }
+                    }
+                }
+
+                // For continuation rows (same POD as previous), inherit T/T, T/S, Free time from previous row
+                if ($pod === $lastPod) {
+                    if ($tt === 'TBA' && $lastTT !== 'TBA') {
+                        $tt = $lastTT;
+                    }
+                    if ($ts === 'TBA' && $lastTS !== 'TBA') {
+                        $ts = $lastTS;
+                    }
+                    if ($freeTime === 'TBA' && $lastFreeTime !== 'TBA') {
+                        $freeTime = $lastFreeTime;
+                    }
+                }
+
+                // Update last known values for propagation
+                if ($tt !== 'TBA') $lastTT = $tt;
+                if ($ts !== 'TBA') $lastTS = $ts;
+                if ($freeTime !== 'TBA') $lastFreeTime = $freeTime;
             }
 
             // Build remark: service route + surcharge if available
