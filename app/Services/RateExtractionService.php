@@ -1330,30 +1330,47 @@ class RateExtractionService
             // After table merging, all tables now have these columns inline
             $numCells = count($cells);
 
-            // For TABLE 1/2 (merged), the T/T, T/S, Free time are in the last 3 columns
-            // Full row format (10+ cols): POL | POD | Service | 20' | 40' | Reefer | Surcharge | T/T | T/S | Free
-            // Continuation row format (5 cols): POL | 20' | 40' | T/T | T/S
+            // For TABLE 1/2 (merged), the T/T, T/S, Free time are after the rate columns
+            // Full row format (10+ cols): POL | POD | Service | 20' | 40' | T/T | T/S | Free | (duplicate cols)
+            // Continuation row format (5+ cols): POL | 20' | 40' | T/T | T/S | ...
+            // NOTE: Merged tables may have duplicate T/T, T/S, Free columns - we want the FIRST occurrence
             if (is_numeric($rowKey) || strpos($rowKey, 'T2_R') === 0) {
                 // TABLE 1 or TABLE 2 rows - extract from inline columns
-                // Scan from the end to find T/T, T/S, Free time
-                for ($i = $numCells - 1; $i >= 3; $i--) {
+                // Scan FORWARD from after rate columns to find FIRST T/T, T/S, Free time
+                // (not from the end, as merged tables may have duplicate columns)
+
+                // Determine start index based on row type:
+                // - Full row: POL | POD | Service | 20' | 40' | T/T... → start at 5
+                // - Continuation row: POL | 20' | 40' | T/T... → start at 3
+                $isContinuationRow = ($pod === $lastPod) ||
+                    ($isPureRate($col1) && $isPureRate($col2)) ||
+                    ($col1IsServiceCode && $col2IsNumeric);
+                $startIdx = $isContinuationRow ? 3 : 5;
+
+                for ($i = $startIdx; $i < $numCells; $i++) {
                     $cellVal = trim($cells[$i] ?? '');
                     if (empty($cellVal)) continue;
 
-                    // Free time pattern: "X days", "X/Y days", "X dem/ Y det"
-                    if ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
-                        $freeTime = $cellVal;
+                    // T/T pattern: number like "5", "15-20", "10,11", "11, 6" - but not large rates
+                    // Allow optional spaces after comma/hyphen. Check T/T FIRST.
+                    if ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal)) {
+                        $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
+                        if ($firstNum <= 50) { // T/T is typically under 50 days
+                            $tt = $cellVal;
+                        }
                     }
                     // T/S pattern: "Direct", "T/S XXX"
                     elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
                         $ts = $cellVal;
                     }
-                    // T/T pattern: number like "5", "15-20", "10,11" - but not large rates
-                    elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\d+)*$/', $cellVal)) {
-                        $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
-                        if ($firstNum <= 50) { // T/T is typically under 50 days
-                            $tt = $cellVal;
-                        }
+                    // Free time pattern: "X days", "X/Y days", "X dem/ Y det"
+                    elseif ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
+                        $freeTime = $cellVal;
+                    }
+
+                    // Stop once we have all three values (first occurrence set)
+                    if ($tt !== 'TBA' && $ts !== 'TBA' && $freeTime !== 'TBA') {
+                        break;
                     }
                 }
 
@@ -1429,8 +1446,8 @@ class RateExtractionService
                         elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
                             $ts = $cellVal;
                         }
-                        // T/T pattern (number or number-number)
-                        elseif ($tt === 'TBA' && preg_match('/^\d+(-\d+)?$/', $cellVal)) {
+                        // T/T pattern (number or number-number, allow optional spaces)
+                        elseif ($tt === 'TBA' && preg_match('/^\d+([,-]\s*\d+)?$/', $cellVal)) {
                             $tt = $cellVal;
                         }
                     }
@@ -1462,9 +1479,9 @@ class RateExtractionService
                             $ts = $cellVal;
                         }
                         // T/T pattern: number or number-number (transit days) - but not dates or large rates
-                        // T/T is typically 1-40 days, or comma-separated like "10,11" or range like "15-20"
-                        // Exclude large numbers (> 100) which are likely rates
-                        elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\d+)*$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
+                        // T/T is typically 1-40 days, or comma-separated like "10,11", "11, 6" or range like "15-20"
+                        // Exclude large numbers (> 100) which are likely rates. Allow optional spaces.
+                        elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
                             // Check if it's a reasonable T/T value (not a rate)
                             $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
                             if ($firstNum <= 50) { // T/T is typically under 50 days
