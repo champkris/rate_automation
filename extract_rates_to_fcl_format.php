@@ -2,13 +2,17 @@
 
 require 'vendor/autoload.php';
 
+// Bootstrap Laravel for RateExtractionService
+$app = require_once __DIR__.'/bootstrap/app.php';
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 ini_set('memory_limit', '512M');
 
-$attachmentsDir = '/Users/apichakriskalambasuta/Sites/localhost/rate_automation/temp_attachments/';
+$attachmentsDir = '/Users/apichakriskalambasuta/Sites/localhost/rate_automation/docs/attachments/';
 $outputFile = '/Users/apichakriskalambasuta/Sites/localhost/rate_automation/docs/output/EXTRACTED_RATES_FCL_EXP.xlsx';
 
 // FCL_EXP format columns
@@ -46,10 +50,47 @@ function normalizeRate($value) {
 echo "Starting rate extraction...\n";
 echo str_repeat('=', 100) . "\n\n";
 
-// ===== EXTRACT FROM: UPDATED RATE IN NOV25.xlsx (SITC/KMTC) =====
+// ===== EXTRACT FROM: SITC PDF using RateExtractionService =====
 try {
-    echo "Processing: UPDATED RATE IN NOV25.xlsx\n";
-    $spreadsheet = IOFactory::load($attachmentsDir . 'UPDATED RATE IN NOV25.xlsx');
+    echo "Processing: PUBLIC QUOTATION 2025 DEC 25 SITC.pdf\n";
+    $rateService = new App\Services\RateExtractionService();
+    $sitcRates = $rateService->extractRates($attachmentsDir . "PUBLIC QUOTATION 2025  DEC 25 SITC.pdf", "sitc", "");
+
+    $startCount = count($allRates);
+    foreach ($sitcRates as $rate) {
+        $allRates[] = [
+            'CARRIER' => 'SITC',
+            'POL' => $rate['POL'] ?? '',
+            'POD' => $rate['POD'] ?? '',
+            'CUR' => 'USD',
+            "20'" => $rate["20'"] ?? 'TBA',
+            "40'" => $rate["40'"] ?? 'TBA',
+            '40 HQ' => $rate["40'HC"] ?? $rate["40'"] ?? 'TBA',
+            '20 TC' => '',
+            '20 RF' => $rate["20'RF"] ?? '',
+            '40RF' => $rate["40'RF"] ?? '',
+            'ETD BKK' => '',
+            'ETD LCH' => '',
+            'T/T' => $rate['T/T'] ?? 'TBA',
+            'T/S' => $rate['T/S'] ?? 'TBA',
+            'FREE TIME' => $rate['FREE TIME'] ?? 'TBA',
+            'VALIDITY' => $rate['VALIDITY'] ?? '',
+            'REMARK' => $rate['REMARK'] ?? '',
+            'Export' => '',
+            'Who use?' => '',
+            'Rate Adjust' => '',
+            '1.1' => ''
+        ];
+    }
+    echo "  ✓ Extracted " . (count($allRates) - $startCount) . " rates\n\n";
+} catch (Exception $e) {
+    echo "  ✗ Error: " . $e->getMessage() . "\n\n";
+}
+
+// ===== EXTRACT FROM: UPDATED RATE IN DEC25.xlsx (KMTC) =====
+try {
+    echo "Processing: UPDATED RATE IN DEC25.xlsx\n";
+    $spreadsheet = IOFactory::load($attachmentsDir . 'UPDATED RATE IN DEC25.xlsx');
     $worksheet = $spreadsheet->getActiveSheet();
     $highestRow = $worksheet->getHighestDataRow();
 
@@ -105,10 +146,10 @@ try {
     echo "  ✗ Error: " . $e->getMessage() . "\n\n";
 }
 
-// ===== EXTRACT FROM: FAK Rate of 1-15 NOV 25.xlsx (RCL) =====
+// ===== EXTRACT FROM: FAK Rate of 1-15 DEC 25.xlsx (RCL) =====
 try {
-    echo "Processing: FAK Rate of 1-15 NOV 25.xlsx\n";
-    $spreadsheet = IOFactory::load($attachmentsDir . 'FAK Rate of 1-15 NOV 25.xlsx');
+    echo "Processing: FAK Rate of 1-15 DEC 25.xlsx\n";
+    $spreadsheet = IOFactory::load($attachmentsDir . 'FAK Rate of 1-15 DEC 25.xlsx');
     $worksheet = $spreadsheet->getSheetByName('RCL');
     $highestRow = $worksheet->getHighestDataRow();
 
@@ -156,7 +197,7 @@ try {
             'T/T' => $transitTime,
             'T/S' => $serviceInfo,
             'FREE TIME' => $freeTime,
-            'VALIDITY' => '1-15 Nov',
+            'VALIDITY' => '1-15 Dec',
             'REMARK' => $remark,
             'Export' => '',
             'Who use?' => '',
@@ -171,10 +212,10 @@ try {
     echo "  ✗ Error: " . $e->getMessage() . "\n\n";
 }
 
-// ===== EXTRACT FROM: FAK Rate of 1-30 NOV on Northeast& Southeast Asia.xls (RCL) =====
+// ===== EXTRACT FROM: FAK Rate of 1-31 DEC on Northeast_ Southeast Asia.xls (RCL) =====
 try {
-    echo "Processing: FAK Rate of 1-30 NOV on Northeast& Southeast Asia.xls\n";
-    $spreadsheet = IOFactory::load($attachmentsDir . 'FAK Rate of 1-30 NOV  on Northeast& Southeast Asia .xls');
+    echo "Processing: FAK Rate of 1-31 DEC on Northeast_ Southeast Asia.xls\n";
+    $spreadsheet = IOFactory::load($attachmentsDir . 'FAK Rate of 1-31 DEC  on Northeast_ Southeast Asia .xls');
     $worksheet = $spreadsheet->getSheetByName('RCL');
     $highestRow = $worksheet->getHighestDataRow();
 
@@ -222,7 +263,7 @@ try {
             'T/T' => $transitTime,
             'T/S' => $serviceInfo,
             'FREE TIME' => $freeTime,
-            'VALIDITY' => '1-30 Nov',
+            'VALIDITY' => '1-31 Dec',
             'REMARK' => $remark,
             'Export' => '',
             'Who use?' => '',

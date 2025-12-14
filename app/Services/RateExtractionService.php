@@ -1134,6 +1134,9 @@ class RateExtractionService
 
     /**
      * Parse SITC table format (from Azure OCR)
+     *
+     * After table merging, TABLE 1 now contains full row data including T/T, T/S, Free time.
+     * TABLE 2 is a separate table (continuation of different routes), also with merged columns.
      */
     protected function parseSitcTable(array $lines, string $validity): array
     {
@@ -1153,6 +1156,7 @@ class RateExtractionService
         $tableMetadata = []; // Store metadata tables keyed by table number and row
 
         // First pass: organize by table
+        // Note: After table merging, TABLE 1 and TABLE 2 now have T/T, T/S, Free time in their columns
         foreach ($lines as $line) {
             if (preg_match('/^TABLE (\d+)/', $line, $tableMatch)) {
                 $currentTable = intval($tableMatch[1]);
@@ -1164,10 +1168,13 @@ class RateExtractionService
             $rowNum = intval($matches[1]);
             $cells = explode(' | ', $matches[2]);
 
+            // TABLE 1 and TABLE 2 are now merged tables with inline T/T, T/S, Free time
+            // Store them all in table1Data for unified processing
             if ($currentTable == 1) {
                 $table1Data[$rowNum] = $cells;
             } elseif ($currentTable == 2) {
-                $table2Data[$rowNum] = $cells;
+                // TABLE 2 rows are continuation - add with unique keys to avoid collision
+                $table1Data['T2_R' . $rowNum] = $cells;
             } elseif (in_array($currentTable, $metadataTables)) {
                 // Store metadata tables separately
                 $tableMetadata[$currentTable][$rowNum] = $cells;
@@ -1177,73 +1184,9 @@ class RateExtractionService
             }
         }
 
-        // Pre-process TABLE 2 to propagate merged cell values
-        // Surcharge and Free time columns have DIFFERENT merge lengths - track independently
-        // Free time can span multiple surcharge blocks
-        $lastValidSurcharge = '';
-        $lastValidFreeTime = '';
-        $processedTable2 = [];
-
-        foreach ($table2Data as $rowNum => $t2row) {
-            $col0 = trim($t2row[0] ?? '');
-            $col1 = trim($t2row[1] ?? '');
-            $col2 = trim($t2row[2] ?? '');
-            $col3 = trim($t2row[3] ?? '');
-
-            // Check if col0 has a full surcharge text (not just a number)
-            $hasFullSurcharge = !preg_match('/^\d+(-\d+)?$/', $col0) && !empty($col0)
-                && stripos($col0, 'surcharge') === false && stripos($col0, 'Dem /Det') === false;
-
-            // Check if this row has NEW free time data (in col3 or col2)
-            // Free time appears in col3 for full rows, or col2 for some continuation rows
-            $hasNewFreeTime = false;
-            $currentFreeTime = '';
-            if (!empty($col3) && preg_match('/day/i', $col3)) {
-                // Free time in col3 (standard position)
-                $hasNewFreeTime = true;
-                $currentFreeTime = $col3;
-            } elseif (!$hasFullSurcharge && preg_match('/day|det/i', $col2)) {
-                // Free time in col2 only for continuation rows (where col0 is T/T, col1 is T/S)
-                $hasNewFreeTime = true;
-                $currentFreeTime = $col2;
-            }
-
-            // Update surcharge tracking
-            if ($hasFullSurcharge) {
-                $lastValidSurcharge = $col0;
-            }
-
-            // Update free time tracking - propagates until a new free time value is found
-            if ($hasNewFreeTime) {
-                $lastValidFreeTime = $currentFreeTime;
-            }
-
-            // Determine T/T and T/S based on row type
-            $tt = '';
-            $ts = '';
-            if ($hasFullSurcharge) {
-                // Full row: col0=surcharge, col1=T/T, col2=T/S (or free time if col3 empty)
-                $tt = $col1;
-                // T/S is in col2 only if it doesn't contain free time text
-                if (!preg_match('/day|det/i', $col2)) {
-                    $ts = $col2;
-                }
-            } else {
-                // Continuation row: col0=T/T, col1=T/S
-                $tt = $col0;
-                // T/S is in col1 only if it doesn't contain free time text
-                if (!preg_match('/day|det/i', $col1)) {
-                    $ts = $col1;
-                }
-            }
-
-            $processedTable2[$rowNum] = [
-                'surcharge' => $lastValidSurcharge,
-                'tt' => $tt,
-                'ts' => $ts,
-                'freetime' => $lastValidFreeTime,
-            ];
-        }
+        // TABLE 2 pre-processing is no longer needed since TABLE 1 and 2 are now merged
+        // with T/T, T/S, Free time columns already inline
+        $processedTable2 = []; // Keep for backward compatibility
 
         // Second pass: process table data
         foreach ($table1Data as $rowKey => $cells) {
@@ -1281,9 +1224,17 @@ class RateExtractionService
             $col4 = trim($cells[4] ?? '');
             $col5 = trim($cells[5] ?? ''); // Other surcharge/condition column
 
-            // Check if col2 is numeric (a rate) or text (a service code/POD)
-            $col2IsNumeric = is_numeric(str_replace(',', '', $col2));
-            $col3IsNumeric = is_numeric(str_replace(',', '', $col3));
+            // Check if col values are numeric rates (not T/T values with commas like "5,12,4,5")
+            // Pure numeric = digits only OR digits with thousands separator (e.g., "1,500")
+            $isPureRate = function($val) {
+                $v = trim($val);
+                if (empty($v)) return false;
+                // Rate: pure digits OR digits with single comma followed by 3 digits (thousands)
+                return preg_match('/^\d+$/', $v) || preg_match('/^\d{1,3},\d{3}$/', $v);
+            };
+
+            $col2IsNumeric = $isPureRate($col2);
+            $col3IsNumeric = $isPureRate($col3);
             $col1IsServiceCode = $isServiceCode($col1);
 
             $surcharge = ''; // Will hold the "Other surcharge/condition" value
@@ -1314,25 +1265,39 @@ class RateExtractionService
                 $rate40 = str_replace(',', '', $col3);
                 $surcharge = $table2Surcharge ?: $col4; // Prefer TABLE 2, fallback to cell
                 $lastServiceRoute = $serviceRoute;
-            } elseif (count($cells) >= 7 && $col3IsNumeric && !$col1IsServiceCode) {
-                // Full row with many columns: POL | POD | Service | 20' | 40' | Surcharge | ...
-                $pod = $col1;
-                $serviceRoute = $col2;
-                $rate20 = str_replace(',', '', $col3);
-                $rate40 = str_replace(',', '', $col4);
-                $surcharge = $table2Surcharge ?: $col5; // Prefer TABLE 2, fallback to cell
-                $lastPod = $pod;
-                $lastServiceRoute = $serviceRoute;
-            } elseif (is_numeric(str_replace(',', '', $col1))) {
-                // Continuation row where col1 is numeric: | 300 | 450 |
+            } elseif ($isPureRate($col1) && $isPureRate($col2)) {
+                // Continuation row where col1 and col2 are pure numeric rates: POL | 20' | 40' | ...
+                // This MUST be checked before the >= 7 cells check to avoid mismatching T/T as rates
+                // Uses $isPureRate to match pure digits OR thousands-formatted rates (e.g., "1,130")
                 $pod = $lastPod;
                 $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col1);
                 $rate40 = str_replace(',', '', $col2);
                 $surcharge = $table2Surcharge ?: $col3; // Prefer TABLE 2, fallback to cell
-            } elseif ($col2IsNumeric && !empty($col1)) {
+            } elseif (count($cells) >= 7 && $col3IsNumeric && !$col1IsServiceCode) {
+                // Multiple column formats possible:
+                // 1) POL | POD | Service | 20' | 40' | ... (service code in col2)
+                // 2) POL | POD | 20' | 40' | T/T | T/S | Free (no service code, col2 is rate)
+                if ($isServiceCode($col2)) {
+                    // Format 1: Full row with service code
+                    $pod = $col1;
+                    $serviceRoute = $col2;
+                    $rate20 = str_replace(',', '', $col3);
+                    $rate40 = str_replace(',', '', $col4);
+                    $surcharge = $table2Surcharge ?: $col5;
+                    $lastServiceRoute = $serviceRoute;
+                } else {
+                    // Format 2: Row without service code (col2 is rate20)
+                    $pod = $col1;
+                    $serviceRoute = $lastServiceRoute; // Inherit from previous
+                    $rate20 = str_replace(',', '', $col2);
+                    $rate40 = str_replace(',', '', $col3);
+                    $surcharge = $table2Surcharge ?: $col4;
+                }
+                $lastPod = $pod;
+            } elseif ($col2IsNumeric && !empty($col1) && !preg_match('/^\d+$/', $col1)) {
                 // 4-column format without service: POL | POD | 20' | 40'
-                // col1 is POD, col2 is rate20, col3 is rate40
+                // col1 is POD (not pure numeric), col2 is rate20, col3 is rate40
                 $pod = $col1;
                 $serviceRoute = $lastServiceRoute; // Inherit service from previous row
                 $rate20 = str_replace(',', '', $col2);
@@ -1361,15 +1326,48 @@ class RateExtractionService
 
             if (empty($pod) || (empty($rate20) && empty($rate40))) continue;
 
-            // Use TABLE 2 values for T/T, T/S, Free time if available (TABLE 1 rows)
-            if (!empty($table2TT)) {
-                $tt = $table2TT;
-            }
-            if (!empty($table2TS)) {
-                $ts = $table2TS;
-            }
-            if (!empty($table2FreeTime)) {
-                $freeTime = $table2FreeTime;
+            // Extract T/T, T/S, Free time from inline merged columns
+            // After table merging, all tables now have these columns inline
+            $numCells = count($cells);
+
+            // For TABLE 1/2 (merged), the T/T, T/S, Free time are in the last 3 columns
+            // Full row format (10+ cols): POL | POD | Service | 20' | 40' | Reefer | Surcharge | T/T | T/S | Free
+            // Continuation row format (5 cols): POL | 20' | 40' | T/T | T/S
+            if (is_numeric($rowKey) || strpos($rowKey, 'T2_R') === 0) {
+                // TABLE 1 or TABLE 2 rows - extract from inline columns
+                // Scan from the end to find T/T, T/S, Free time
+                for ($i = $numCells - 1; $i >= 3; $i--) {
+                    $cellVal = trim($cells[$i] ?? '');
+                    if (empty($cellVal)) continue;
+
+                    // Free time pattern: "X days", "X/Y days", "X dem/ Y det"
+                    if ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
+                        $freeTime = $cellVal;
+                    }
+                    // T/S pattern: "Direct", "T/S XXX"
+                    elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                        $ts = $cellVal;
+                    }
+                    // T/T pattern: number like "5", "15-20", "10,11" - but not large rates
+                    elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\d+)*$/', $cellVal)) {
+                        $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
+                        if ($firstNum <= 50) { // T/T is typically under 50 days
+                            $tt = $cellVal;
+                        }
+                    }
+                }
+
+                // For continuation rows (same POD as previous), inherit T/T, T/S, Free time
+                if ($pod === $lastPod) {
+                    if ($tt === 'TBA' && $lastTT !== 'TBA') $tt = $lastTT;
+                    if ($ts === 'TBA' && $lastTS !== 'TBA') $ts = $lastTS;
+                    if ($freeTime === 'TBA' && $lastFreeTime !== 'TBA') $freeTime = $lastFreeTime;
+                }
+
+                // Update last known values for propagation
+                if ($tt !== 'TBA') $lastTT = $tt;
+                if ($ts !== 'TBA') $lastTS = $ts;
+                if ($freeTime !== 'TBA') $lastFreeTime = $freeTime;
             }
 
             // For TABLE 3+ rows, extract T/T, T/S, Free time from inline columns or paired metadata table
@@ -1441,8 +1439,15 @@ class RateExtractionService
                 // If metadata not found, try inline columns (for TABLE 3/4 which have inline data)
                 if ($tt === 'TBA' || $ts === 'TBA' || $freeTime === 'TBA') {
                     // For rows with enough columns (full rows and continuation rows)
-                    // Scan all cells after the rate columns to find T/T, T/S, Free time
-                    $startIdx = ($numCells >= 8) ? 5 : 3; // Start after rates
+                    // Scan cells from the end to find T/T, T/S, Free time
+                    // Be careful not to pick up rate values (large numbers like 300, 500, etc.)
+                    // T/T values are typically small (1-40 days) or ranges like "10,11" or "15-20"
+
+                    // Determine start index based on row structure:
+                    // Full row (8+ cols): POL | POD | Service | 20' | 40' | [Reefer] | [Surcharge] | T/T | T/S | Free
+                    // Continuation row (4-7 cols): POL | 20' | 40' | T/T | T/S | Free
+                    // We should only scan the last 3 cells for T/T, T/S, Free time
+                    $startIdx = max(0, $numCells - 3);
 
                     for ($i = $numCells - 1; $i >= $startIdx; $i--) {
                         $cellVal = trim($cells[$i] ?? '');
@@ -1456,9 +1461,15 @@ class RateExtractionService
                         elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
                             $ts = $cellVal;
                         }
-                        // T/T pattern: number or number-number (transit days) - but not dates like "09-Oct"
-                        elseif ($tt === 'TBA' && preg_match('/^\d+(-\d+)?$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
-                            $tt = $cellVal;
+                        // T/T pattern: number or number-number (transit days) - but not dates or large rates
+                        // T/T is typically 1-40 days, or comma-separated like "10,11" or range like "15-20"
+                        // Exclude large numbers (> 100) which are likely rates
+                        elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\d+)*$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
+                            // Check if it's a reasonable T/T value (not a rate)
+                            $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
+                            if ($firstNum <= 50) { // T/T is typically under 50 days
+                                $tt = $cellVal;
+                            }
                         }
                     }
                 }
