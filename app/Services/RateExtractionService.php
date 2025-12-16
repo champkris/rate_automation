@@ -46,6 +46,9 @@ class RateExtractionService
         // Auto-detect pattern from filename if empty or set to 'auto'
         if ($pattern === '' || $pattern === 'auto') {
             $pattern = $this->detectPatternFromFilename($filename);
+        } else {
+            // Normalize pattern to lowercase for case-insensitive matching
+            $pattern = strtolower($pattern);
         }
 
         // Handle PDF files (requires Azure OCR results)
@@ -1146,14 +1149,40 @@ class RateExtractionService
         $table2Data = [];
         $lastPod = '';
         $lastServiceRoute = '';
+        $lastSurcharge = '';
         $lastFreeTime = 'TBA';
         $lastTT = 'TBA';
         $lastTS = 'TBA';
+        $podSurcharge = []; // Track surcharge by POD for merged cells
+
+        // Country/region-specific surcharges from SITC remarks (for TABLE 4 ports without surcharge column)
+        // Indonesia ports surcharge from SITC remark #15
+        $indonesiaPorts = ['Jakarta', 'NPCT1', 'Cikarang', 'CKD', 'Semarang', 'Makassar', 'Batam', 'Surabaya', 'Balikpapan'];
+        $indonesiaSurcharge = "INC LSS exclude CIC Usd 20/20'GP 30/40',40'HC collect at destination";
+
+        // Korea ports surcharges (from OCR data)
+        $koreaSurcharges = [
+            'BUSAN' => 'Include LSS, EBS, CIS',
+            'INCHON' => 'Include LSS, EBS, CIS, CIC',
+        ];
+
+        // Japan main ports surcharge from SITC remark #7
+        $japanMainPorts = ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya'];
+        $japanMainSurcharge = 'Include LSS';
+
+        // Malaysia T/S ports (Kuching, Bintulu) - no specific surcharge in remark
+        $malaysiaTSPorts = ['Kuching', 'Sarawak', 'Bintulu'];
 
         // Tables that contain T/T, T/S, Free time metadata (not rate data)
         // TABLE 7 pairs with TABLE 5+6, TABLE 9 pairs with TABLE 8
         $metadataTables = [7, 9];
         $tableMetadata = []; // Store metadata tables keyed by table number and row
+
+        // Detect if TABLE 2 is a metadata-only table (not merged with TABLE 1)
+        // TABLE 2 is metadata-only when it has columns like: Surcharge | T/T | Transit type | Free time
+        // and NOT rate columns like: 20'GP | 40',40'HC | ...
+        $table2IsMetadata = false;
+        $table2RawData = [];
 
         // First pass: organize by table
         // Note: After table merging, TABLE 1 and TABLE 2 now have T/T, T/S, Free time in their columns
@@ -1168,13 +1197,27 @@ class RateExtractionService
             $rowNum = intval($matches[1]);
             $cells = explode(' | ', $matches[2]);
 
+            // Check TABLE 2 header row to determine if it's a metadata table
+            if ($currentTable == 2 && $rowNum == 0) {
+                // If TABLE 2 row 0 contains "T/T" or "Transit" header, it's a metadata table
+                $headerText = implode(' ', $cells);
+                if (preg_match('/T\/T|Transit|Free time/i', $headerText) &&
+                    !preg_match('/20.*GP|40.*HC|FREIGHT/i', $headerText)) {
+                    $table2IsMetadata = true;
+                }
+            }
+
             // TABLE 1 and TABLE 2 are now merged tables with inline T/T, T/S, Free time
             // Store them all in table1Data for unified processing
             if ($currentTable == 1) {
                 $table1Data[$rowNum] = $cells;
             } elseif ($currentTable == 2) {
-                // TABLE 2 rows are continuation - add with unique keys to avoid collision
-                $table1Data['T2_R' . $rowNum] = $cells;
+                // Store TABLE 2 raw data for later processing
+                $table2RawData[$rowNum] = $cells;
+                // Only add to table1Data if NOT a metadata-only table
+                if (!$table2IsMetadata) {
+                    $table1Data['T2_R' . $rowNum] = $cells;
+                }
             } elseif (in_array($currentTable, $metadataTables)) {
                 // Store metadata tables separately
                 $tableMetadata[$currentTable][$rowNum] = $cells;
@@ -1184,9 +1227,51 @@ class RateExtractionService
             }
         }
 
-        // TABLE 2 pre-processing is no longer needed since TABLE 1 and 2 are now merged
-        // with T/T, T/S, Free time columns already inline
-        $processedTable2 = []; // Keep for backward compatibility
+        // Pre-process TABLE 2 if it's a metadata-only table
+        // Extract T/T, T/S, Free time keyed by row number for lookup
+        $processedTable2 = [];
+        if ($table2IsMetadata) {
+            foreach ($table2RawData as $rowNum => $cells) {
+                if ($rowNum == 0) continue; // Skip header row
+
+                $tt = 'TBA';
+                $ts = 'TBA';
+                $freeTime = 'TBA';
+                $surcharge = '';
+
+                foreach ($cells as $cellVal) {
+                    $cellVal = trim($cellVal);
+                    if (empty($cellVal)) continue;
+
+                    // T/T pattern: "5", "15-20", "10,11", "11, 6"
+                    if ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal)) {
+                        $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
+                        if ($firstNum <= 50) {
+                            $tt = $cellVal;
+                        }
+                    }
+                    // T/S pattern: "Direct", "T/S XXX"
+                    elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                        $ts = $cellVal;
+                    }
+                    // Free time pattern: "X days", "X/Y days"
+                    elseif ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
+                        $freeTime = $cellVal;
+                    }
+                    // Surcharge (INC LSS, etc.)
+                    elseif (empty($surcharge) && preg_match('/INC|LSS|CIC|Exclude|Include/i', $cellVal)) {
+                        $surcharge = $cellVal;
+                    }
+                }
+
+                $processedTable2[$rowNum] = [
+                    'surcharge' => $surcharge,
+                    'tt' => $tt,
+                    'ts' => $ts,
+                    'freetime' => $freeTime
+                ];
+            }
+        }
 
         // Second pass: process table data
         foreach ($table1Data as $rowKey => $cells) {
@@ -1222,7 +1307,8 @@ class RateExtractionService
             $col2 = trim($cells[2] ?? '');
             $col3 = trim($cells[3] ?? '');
             $col4 = trim($cells[4] ?? '');
-            $col5 = trim($cells[5] ?? ''); // Other surcharge/condition column
+            $col5 = trim($cells[5] ?? '');
+            $col6 = trim($cells[6] ?? '');
 
             // Check if col values are numeric rates (not T/T values with commas like "5,12,4,5")
             // Pure numeric = digits only OR digits with thousands separator (e.g., "1,500")
@@ -1231,6 +1317,13 @@ class RateExtractionService
                 if (empty($v)) return false;
                 // Rate: pure digits OR digits with single comma followed by 3 digits (thousands)
                 return preg_match('/^\d+$/', $v) || preg_match('/^\d{1,3},\d{3}$/', $v);
+            };
+
+            // Helper to check if a value looks like a surcharge (INC LSS, Include, Exclude, etc.)
+            $isSurchargeText = function($val) {
+                $v = trim($val);
+                if (empty($v)) return false;
+                return preg_match('/^(INC|Include|Exclude|no have|LSS|CIC)/i', $v);
             };
 
             $col2IsNumeric = $isPureRate($col2);
@@ -1257,52 +1350,98 @@ class RateExtractionService
             // Check for continuation row with service code FIRST (before full row check)
             // Pattern: POL | Service | 20' | 40' | ... (e.g., "LKB/Sahathai/TPT | VTX1 | 430 | 750")
             if ($col1IsServiceCode && $col2IsNumeric) {
-                // Continuation row with service code
-                // POD should be inherited from previous row
+                // Continuation row with service code - inherit surcharge from main row
                 $pod = $lastPod;
-                $serviceRoute = $col1; // The service code
+                $serviceRoute = $col1;
                 $rate20 = str_replace(',', '', $col2);
                 $rate40 = str_replace(',', '', $col3);
-                $surcharge = $table2Surcharge ?: $col4; // Prefer TABLE 2, fallback to cell
+                $surcharge = $lastSurcharge; // Inherit from main row
                 $lastServiceRoute = $serviceRoute;
             } elseif ($isPureRate($col1) && $isPureRate($col2)) {
                 // Continuation row where col1 and col2 are pure numeric rates: POL | 20' | 40' | ...
-                // This MUST be checked before the >= 7 cells check to avoid mismatching T/T as rates
-                // Uses $isPureRate to match pure digits OR thousands-formatted rates (e.g., "1,130")
+                // Inherit POD, service route, and surcharge from main row
                 $pod = $lastPod;
                 $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col1);
                 $rate40 = str_replace(',', '', $col2);
-                $surcharge = $table2Surcharge ?: $col3; // Prefer TABLE 2, fallback to cell
+                $surcharge = $lastSurcharge; // Inherit from main row
             } elseif (count($cells) >= 7 && $col3IsNumeric && !$col1IsServiceCode) {
                 // Multiple column formats possible:
-                // 1) POL | POD | Service | 20' | 40' | ... (service code in col2)
+                // 1) POL | POD | Service | 20' | 40' | [Reefer note] | Surcharge | T/T | T/S | Free
                 // 2) POL | POD | 20' | 40' | T/T | T/S | Free (no service code, col2 is rate)
                 if ($isServiceCode($col2)) {
                     // Format 1: Full row with service code
+                    // Surcharge is in col6 (after Reefer note), or col5 if col6 is T/T
                     $pod = $col1;
                     $serviceRoute = $col2;
                     $rate20 = str_replace(',', '', $col3);
                     $rate40 = str_replace(',', '', $col4);
-                    $surcharge = $table2Surcharge ?: $col5;
+                    // Find surcharge: check col6 first (INC LSS), then col5, then scan remaining columns
+                    if ($table2Surcharge) {
+                        $surcharge = $table2Surcharge;
+                    } elseif ($isSurchargeText($col6)) {
+                        $surcharge = $col6;
+                    } elseif ($isSurchargeText($col5)) {
+                        $surcharge = $col5;
+                    } else {
+                        // Scan remaining columns for surcharge pattern
+                        for ($i = 5; $i < count($cells) - 3; $i++) {
+                            $cellVal = trim($cells[$i] ?? '');
+                            if ($isSurchargeText($cellVal)) {
+                                $surcharge = $cellVal;
+                                break;
+                            }
+                        }
+                    }
+                    // If no surcharge found, propagate from last surcharge (for merged cells in PDF)
+                    if (empty($surcharge)) {
+                        $surcharge = $lastSurcharge;
+                    }
+                    // Store surcharge by POD and update last surcharge
+                    if (!empty($surcharge)) {
+                        $podSurcharge[$pod] = $surcharge;
+                        $lastSurcharge = $surcharge;
+                    }
                     $lastServiceRoute = $serviceRoute;
                 } else {
                     // Format 2: Row without service code (col2 is rate20)
                     $pod = $col1;
-                    $serviceRoute = $lastServiceRoute; // Inherit from previous
+                    $serviceRoute = $lastServiceRoute;
                     $rate20 = str_replace(',', '', $col2);
                     $rate40 = str_replace(',', '', $col3);
-                    $surcharge = $table2Surcharge ?: $col4;
+                    // Find surcharge in remaining columns
+                    if ($table2Surcharge) {
+                        $surcharge = $table2Surcharge;
+                    } elseif ($isSurchargeText($col4)) {
+                        $surcharge = $col4;
+                    } elseif ($isSurchargeText($col5)) {
+                        $surcharge = $col5;
+                    }
+                    // If no surcharge found, propagate from last surcharge
+                    if (empty($surcharge)) {
+                        $surcharge = $lastSurcharge;
+                    }
+                    if (!empty($surcharge)) {
+                        $podSurcharge[$pod] = $surcharge;
+                        $lastSurcharge = $surcharge;
+                    }
                 }
                 $lastPod = $pod;
             } elseif ($col2IsNumeric && !empty($col1) && !preg_match('/^\d+$/', $col1)) {
                 // 4-column format without service: POL | POD | 20' | 40'
-                // col1 is POD (not pure numeric), col2 is rate20, col3 is rate40
                 $pod = $col1;
-                $serviceRoute = $lastServiceRoute; // Inherit service from previous row
+                $serviceRoute = $lastServiceRoute;
                 $rate20 = str_replace(',', '', $col2);
                 $rate40 = str_replace(',', '', $col3);
-                $surcharge = $table2Surcharge ?: $col4; // Prefer TABLE 2, fallback to cell
+                $surcharge = $isSurchargeText($col4) ? $col4 : ($table2Surcharge ?: '');
+                // If no surcharge found, propagate from last surcharge
+                if (empty($surcharge)) {
+                    $surcharge = $lastSurcharge;
+                }
+                if (!empty($surcharge)) {
+                    $podSurcharge[$pod] = $surcharge;
+                    $lastSurcharge = $surcharge;
+                }
                 $lastPod = $pod;
             } elseif ($isServiceCode($col2) || (!$col2IsNumeric && $col3IsNumeric)) {
                 // 5-column format with service: POL | POD | Service | 20' | 40' | Surcharge
@@ -1310,7 +1449,15 @@ class RateExtractionService
                 $serviceRoute = $col2;
                 $rate20 = str_replace(',', '', $col3);
                 $rate40 = str_replace(',', '', $col4);
-                $surcharge = $table2Surcharge ?: $col5; // Prefer TABLE 2, fallback to cell
+                $surcharge = $isSurchargeText($col6) ? $col6 : ($isSurchargeText($col5) ? $col5 : ($table2Surcharge ?: ''));
+                // If no surcharge found, propagate from last surcharge
+                if (empty($surcharge)) {
+                    $surcharge = $lastSurcharge;
+                }
+                if (!empty($surcharge)) {
+                    $podSurcharge[$pod] = $surcharge;
+                    $lastSurcharge = $surcharge;
+                }
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             } else {
@@ -1319,59 +1466,82 @@ class RateExtractionService
                 $serviceRoute = $col2;
                 $rate20 = str_replace(',', '', $col3);
                 $rate40 = str_replace(',', '', $col4);
-                $surcharge = $table2Surcharge ?: $col5;
+                $surcharge = $isSurchargeText($col6) ? $col6 : ($isSurchargeText($col5) ? $col5 : ($table2Surcharge ?: ''));
+                // If no surcharge found, propagate from last surcharge
+                if (empty($surcharge)) {
+                    $surcharge = $lastSurcharge;
+                }
+                if (!empty($surcharge)) {
+                    $podSurcharge[$pod] = $surcharge;
+                    $lastSurcharge = $surcharge;
+                }
                 $lastPod = $pod;
                 $lastServiceRoute = $serviceRoute;
             }
 
             if (empty($pod) || (empty($rate20) && empty($rate40))) continue;
 
-            // Extract T/T, T/S, Free time from inline merged columns
+            // Extract T/T, T/S, Free time from inline merged columns or from pre-processed TABLE 2
             // After table merging, all tables now have these columns inline
             $numCells = count($cells);
 
-            // For TABLE 1/2 (merged), the T/T, T/S, Free time are after the rate columns
-            // Full row format (10+ cols): POL | POD | Service | 20' | 40' | T/T | T/S | Free | (duplicate cols)
-            // Continuation row format (5+ cols): POL | 20' | 40' | T/T | T/S | ...
-            // NOTE: Merged tables may have duplicate T/T, T/S, Free columns - we want the FIRST occurrence
+            // For TABLE 1/2, the T/T, T/S, Free time are either:
+            // 1) From pre-processed TABLE 2 (when TABLE 2 is a metadata-only table)
+            // 2) From inline columns (when TABLE 2 is merged with TABLE 1)
             if (is_numeric($rowKey) || strpos($rowKey, 'T2_R') === 0) {
-                // TABLE 1 or TABLE 2 rows - extract from inline columns
-                // Scan FORWARD from after rate columns to find FIRST T/T, T/S, Free time
-                // (not from the end, as merged tables may have duplicate columns)
+                // First, check if we have metadata from pre-processed TABLE 2
+                if (!empty($table2TT) && $table2TT !== 'TBA') {
+                    $tt = $table2TT;
+                }
+                if (!empty($table2TS) && $table2TS !== 'TBA') {
+                    $ts = $table2TS;
+                }
+                if (!empty($table2FreeTime) && $table2FreeTime !== 'TBA') {
+                    $freeTime = $table2FreeTime;
+                }
 
-                // Determine start index based on row type:
-                // - Full row: POL | POD | Service | 20' | 40' | T/T... → start at 5
-                // - Continuation row: POL | 20' | 40' | T/T... → start at 3
-                // Note: We check the actual row structure, not $pod === $lastPod, because
-                // $lastPod was already updated by the rate extraction branch above.
-                $isContinuationRow = ($isPureRate($col1) && $isPureRate($col2)) ||
-                    ($col1IsServiceCode && $col2IsNumeric);
-                $startIdx = $isContinuationRow ? 3 : 5;
+                // If not from TABLE 2, try to extract from inline columns
+                // Full row format (10+ cols): POL | POD | Service | 20' | 40' | T/T | T/S | Free | (duplicate cols)
+                // Continuation row format (5+ cols): POL | 20' | 40' | T/T | T/S | ...
+                // NOTE: Merged tables may have duplicate T/T, T/S, Free columns - we want the FIRST occurrence
+                if ($tt === 'TBA' || $ts === 'TBA' || $freeTime === 'TBA') {
+                    // Scan FORWARD from after rate columns to find FIRST T/T, T/S, Free time
+                    // (not from the end, as merged tables may have duplicate columns)
 
-                for ($i = $startIdx; $i < $numCells; $i++) {
-                    $cellVal = trim($cells[$i] ?? '');
-                    if (empty($cellVal)) continue;
+                    // Determine start index based on row type:
+                    // - Full row: POL | POD | Service | 20' | 40' | T/T... → start at 5
+                    // - Continuation row: POL | 20' | 40' | T/T... → start at 3
+                    // Note: We check the actual row structure, not $pod === $lastPod, because
+                    // $lastPod was already updated by the rate extraction branch above.
+                    $isContinuationRow = ($isPureRate($col1) && $isPureRate($col2)) ||
+                        ($col1IsServiceCode && $col2IsNumeric);
+                    $startIdx = $isContinuationRow ? 3 : 5;
 
-                    // T/T pattern: number like "5", "15-20", "10,11", "11, 6" - but not large rates
-                    // Allow optional spaces after comma/hyphen. Check T/T FIRST.
-                    if ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal)) {
-                        $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
-                        if ($firstNum <= 50) { // T/T is typically under 50 days
-                            $tt = $cellVal;
+                    for ($i = $startIdx; $i < $numCells; $i++) {
+                        $cellVal = trim($cells[$i] ?? '');
+                        if (empty($cellVal)) continue;
+
+                        // T/T pattern: number like "5", "15-20", "10,11", "11, 6" - but not large rates
+                        // Allow optional spaces after comma/hyphen. Check T/T FIRST.
+                        if ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal)) {
+                            $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
+                            if ($firstNum <= 50) { // T/T is typically under 50 days
+                                $tt = $cellVal;
+                            }
                         }
-                    }
-                    // T/S pattern: "Direct", "T/S XXX"
-                    elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
-                        $ts = $cellVal;
-                    }
-                    // Free time pattern: "X days", "X/Y days", "X dem/ Y det"
-                    elseif ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
-                        $freeTime = $cellVal;
-                    }
+                        // T/S pattern: "Direct", "T/S XXX"
+                        elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                            $ts = $cellVal;
+                        }
+                        // Free time pattern: "X days", "X/Y days", "X dem/ Y det"
+                        elseif ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+\s*day/i', $cellVal)) {
+                            $freeTime = $cellVal;
+                        }
 
-                    // Stop once we have all three values (first occurrence set)
-                    if ($tt !== 'TBA' && $ts !== 'TBA' && $freeTime !== 'TBA') {
-                        break;
+                        // Stop once we have all three values (first occurrence set)
+                        if ($tt !== 'TBA' && $ts !== 'TBA' && $freeTime !== 'TBA') {
+                            break;
+                        }
                     }
                 }
 
@@ -1417,11 +1587,23 @@ class RateExtractionService
                     $metaTable = 9;
                 }
 
-                // TABLE 4 has merged Free time columns not captured by OCR
-                // Rows 0-15 (N.MANILA to DAVAO): 7/4 days (dem+detention)
-                // Rows 16-17 (Kuantan): 5/5 days (dem+detention)
-                // Rows 19-20 (Kota kinabalu): 7/5 days (dem+detention)
-                if ($sourceTable == 4) {
+                // ============================================================================
+                // HARDCODED FREE TIME VALUES (Due to OCR merged cell issues)
+                // PDF: PUBLIC QUOTATION 2025 DEC 25 SITC.pdf
+                // These values are hardcoded because Azure OCR doesn't correctly capture
+                // merged Free Time cells in the PDF. If PDF format changes, update these.
+                // ============================================================================
+
+                // TABLE 3 (Philippines/Malaysia routes) - Rows 0-20
+                // OCR shows 7/4 days only from row 14, but PDF shows it applies to rows 0-15
+                // +--------+-------------------+-----------------------------+
+                // | Rows   | PODs              | Free Time                   |
+                // +--------+-------------------+-----------------------------+
+                // | 0-15   | N.MANILA - DAVAO  | 7/4 days (dem+detention)    |
+                // | 16-17  | Kuantan Malaysia  | 5/5 days (dem+detention)    |
+                // | 19-20  | Kota kinabalu     | 7/5 days (dem+detention)    |
+                // +--------+-------------------+-----------------------------+
+                if ($sourceTable == 3) {
                     if ($sourceRow <= 15) {
                         $freeTime = '7/4 days (dem+detention)';
                     } elseif ($sourceRow >= 16 && $sourceRow <= 17) {
@@ -1430,6 +1612,19 @@ class RateExtractionService
                         $freeTime = '7/5 days (dem+detention)';
                     }
                 }
+
+                // TABLE 4 (Korea/Japan routes) - Row 20 only
+                // OCR shows wrong free time for Laem Chabang BUSAN (shows "7 days combine" instead of "10 dem/ 5 det")
+                // +--------+-------------------------+-------------------+
+                // | Row    | POD                     | Free Time         |
+                // +--------+-------------------------+-------------------+
+                // | 20     | BUSAN (Laem Chabang)    | 10 dem/ 5 det     |
+                // +--------+-------------------------+-------------------+
+                // Note: Row 21+ have correct OCR values, no hardcoding needed
+                if ($sourceTable == 4 && $sourceRow == 20) {
+                    $freeTime = '10 dem/ 5 det';
+                }
+                // ============================================================================
 
                 // Try to get metadata from the paired table first
                 if ($metaTable && isset($tableMetadata[$metaTable][$sourceRow])) {
@@ -1457,37 +1652,53 @@ class RateExtractionService
                 // If metadata not found, try inline columns (for TABLE 3/4 which have inline data)
                 if ($tt === 'TBA' || $ts === 'TBA' || $freeTime === 'TBA') {
                     // For rows with enough columns (full rows and continuation rows)
-                    // Scan cells from the end to find T/T, T/S, Free time
-                    // Be careful not to pick up rate values (large numbers like 300, 500, etc.)
-                    // T/T values are typically small (1-40 days) or ranges like "10,11" or "15-20"
+                    // IMPORTANT: Scan FORWARD from after rate columns, not from the end
+                    // Merged tables may have duplicate T/T, T/S columns - we want the FIRST occurrence
+                    //
+                    // Full row (8+ cols): POL | POD | Service | 20' | 40' | [Reefer] | [Surcharge] | T/T | T/S | Free | [duplicates...]
+                    // Continuation row (4-7 cols): POL | 20' | 40' | [Surcharge] | T/T | T/S | Free | [duplicates...]
 
-                    // Determine start index based on row structure:
-                    // Full row (8+ cols): POL | POD | Service | 20' | 40' | [Reefer] | [Surcharge] | T/T | T/S | Free
-                    // Continuation row (4-7 cols): POL | 20' | 40' | T/T | T/S | Free
-                    // We should only scan the last 3 cells for T/T, T/S, Free time
-                    $startIdx = max(0, $numCells - 3);
+                    // Determine start index based on row structure
+                    // Pure rate continuation: POL | 20' | 40' | ... → start at 3
+                    // Service code continuation: POL | Service | 20' | 40' | ... → start at 4
+                    // Full row: POL | POD | Service | 20' | 40' | ... → start at 5
+                    $isPureRateContinuation = ($isPureRate($col1) && $isPureRate($col2));
+                    $isServiceCodeContinuation = ($col1IsServiceCode && $col2IsNumeric);
 
-                    for ($i = $numCells - 1; $i >= $startIdx; $i--) {
+                    if ($isPureRateContinuation) {
+                        $startIdx = 3; // After POL|20'|40'
+                    } elseif ($isServiceCodeContinuation) {
+                        $startIdx = 4; // After POL|Service|20'|40'
+                    } else {
+                        $startIdx = 5; // After POL|POD|Service|20'|40'
+                    }
+
+                    for ($i = $startIdx; $i < $numCells; $i++) {
                         $cellVal = trim($cells[$i] ?? '');
                         if (empty($cellVal)) continue;
 
-                        // Free time pattern: "X days" or "X/Y days" or "X days detention" or "X dem/ Y det"
-                        if ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+/i', $cellVal)) {
-                            $freeTime = $cellVal;
-                        }
-                        // T/S pattern: "Direct", "T/S XXX", "T/S at XXX"
-                        elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
-                            $ts = $cellVal;
-                        }
                         // T/T pattern: number or number-number (transit days) - but not dates or large rates
                         // T/T is typically 1-40 days, or comma-separated like "10,11", "11, 6" or range like "15-20"
-                        // Exclude large numbers (> 100) which are likely rates. Allow optional spaces.
-                        elseif ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
+                        // Check T/T FIRST before T/S to avoid misdetection
+                        if ($tt === 'TBA' && preg_match('/^(\d+)([,-]\s*\d+)*$/', $cellVal) && !preg_match('/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i', $cellVal)) {
                             // Check if it's a reasonable T/T value (not a rate)
                             $firstNum = intval(preg_replace('/[^0-9].*/', '', $cellVal));
                             if ($firstNum <= 50) { // T/T is typically under 50 days
                                 $tt = $cellVal;
                             }
+                        }
+                        // T/S pattern: "Direct", "T/S XXX", "T/S at XXX"
+                        elseif ($ts === 'TBA' && preg_match('/^Direct$|^T\/S/i', $cellVal)) {
+                            $ts = $cellVal;
+                        }
+                        // Free time pattern: "X days" or "X/Y days" or "X days detention" or "X dem/ Y det"
+                        elseif ($freeTime === 'TBA' && preg_match('/\d+.*day|dem.*det|\d+\/\d+/i', $cellVal)) {
+                            $freeTime = $cellVal;
+                        }
+
+                        // Stop once we have all three values (first occurrence set)
+                        if ($tt !== 'TBA' && $ts !== 'TBA' && $freeTime !== 'TBA') {
+                            break;
                         }
                     }
                 }
@@ -1511,10 +1722,55 @@ class RateExtractionService
                 if ($freeTime !== 'TBA') $lastFreeTime = $freeTime;
             }
 
-            // Build remark: service route + surcharge if available
+            // Build remark: service route + surcharge (Other surcharge column) if available
             // Skip surcharge values that are just numbers (T/T, days, etc.) or T/S notes
             $remark = $serviceRoute;
-            if (!empty($surcharge) && !preg_match('/^\d+(-\d+)?$/', $surcharge) && !preg_match('/^T\/S/i', $surcharge) && !preg_match('/^Please recheck/i', $surcharge)) {
+
+            // For TABLE 4+ ports without surcharge column, apply country/region-specific surcharges
+            // Only apply if no surcharge was found in the table or if it's just from forward propagation
+            $needsCountrySurcharge = $isTable3Plus && (empty($surcharge) || $surcharge === $lastSurcharge);
+
+            if ($needsCountrySurcharge) {
+                // Check Indonesia ports (remark #15)
+                $isIndonesiaPort = false;
+                foreach ($indonesiaPorts as $indoPort) {
+                    if (stripos($pod, $indoPort) !== false) {
+                        $isIndonesiaPort = true;
+                        $surcharge = $indonesiaSurcharge;
+                        break;
+                    }
+                }
+
+                // Check Korea ports
+                if (!$isIndonesiaPort) {
+                    foreach ($koreaSurcharges as $koreaPort => $koreaSurcharge) {
+                        if (stripos($pod, $koreaPort) !== false) {
+                            $surcharge = $koreaSurcharge;
+                            break;
+                        }
+                    }
+                }
+
+                // Check Japan main ports (remark #7)
+                if (!$isIndonesiaPort && !isset($koreaSurcharges[strtoupper($pod)])) {
+                    foreach ($japanMainPorts as $japanPort) {
+                        if (stripos($pod, $japanPort) !== false) {
+                            $surcharge = $japanMainSurcharge;
+                            break;
+                        }
+                    }
+                }
+
+                // Check Malaysia T/S ports - no surcharge, clear inherited value
+                foreach ($malaysiaTSPorts as $malaysiaPort) {
+                    if (stripos($pod, $malaysiaPort) !== false) {
+                        $surcharge = ''; // Clear any inherited surcharge
+                        break;
+                    }
+                }
+            }
+
+            if (!empty($surcharge) && !preg_match('/^\d+([,-]\s*\d+)*$/', $surcharge) && !preg_match('/^(Direct|T\/S)/i', $surcharge)) {
                 $remark = $serviceRoute . ($serviceRoute ? ' - ' : '') . $surcharge;
             }
 
