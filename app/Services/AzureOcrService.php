@@ -424,71 +424,123 @@ class AzureOcrService
         // Match paragraphs to rows by Y position
         $leftColCount = $table['columnCount'] ?? 0;
         $mergedCells = $tableCellsByRow;
-        $yTolerance = 0.12;
+        $yTolerance = 0.18;  // Increased from 0.12 to handle larger row spacing (e.g., Jakarta)
 
-        // Build row data: for each row, find matching T/T, T/S, and Free time
+        // Build row data: assign each paragraph to its SINGLE closest row (not row to closest paragraph)
+        // This prevents the same paragraph from being matched by multiple rows
         $rowMetadata = [];
         foreach ($sortedRows as $rowIndex) {
-            $rowY = $rowYPositions[$rowIndex];
             $rowMetadata[$rowIndex] = ['tt' => '', 'ts' => '', 'free' => ''];
+        }
 
-            // Find closest T/T+T/S paragraph
-            $closestTtTs = null;
-            $closestTtTsDist = PHP_INT_MAX;
-            foreach ($ttTsParagraphs as $p) {
-                $dist = abs($rowY - $p['y']);
-                if ($dist < $closestTtTsDist && $dist < $yTolerance) {
-                    $closestTtTsDist = $dist;
-                    $closestTtTs = $p;
+        // Assign each T/T+T/S paragraph to its closest row
+        foreach ($ttTsParagraphs as $p) {
+            $closestRow = null;
+            $closestDist = PHP_INT_MAX;
+            foreach ($sortedRows as $rowIndex) {
+                $dist = abs($rowYPositions[$rowIndex] - $p['y']);
+                if ($dist < $closestDist && $dist < $yTolerance) {
+                    $closestDist = $dist;
+                    $closestRow = $rowIndex;
                 }
             }
-            if ($closestTtTs) {
-                $rowMetadata[$rowIndex]['tt'] = $closestTtTs['tt'];
-                $rowMetadata[$rowIndex]['ts'] = $closestTtTs['ts'];
-            }
-
-            // Find closest Free time paragraph
-            $closestFree = null;
-            $closestFreeDist = PHP_INT_MAX;
-            foreach ($freeParagraphs as $p) {
-                $dist = abs($rowY - $p['y']);
-                if ($dist < $closestFreeDist && $dist < $yTolerance) {
-                    $closestFreeDist = $dist;
-                    $closestFree = $p;
+            if ($closestRow !== null) {
+                // Only assign if this row doesn't already have T/T data, or this paragraph is closer
+                if (empty($rowMetadata[$closestRow]['tt']) || $p['tt']) {
+                    if ($p['tt']) $rowMetadata[$closestRow]['tt'] = $p['tt'];
                 }
-            }
-            if ($closestFree) {
-                $rowMetadata[$rowIndex]['free'] = $closestFree['free'];
+                if (empty($rowMetadata[$closestRow]['ts']) || $p['ts']) {
+                    if ($p['ts']) $rowMetadata[$closestRow]['ts'] = $p['ts'];
+                }
             }
         }
 
-        // Second pass: inherit from previous row for alternate POL rows that have no data
+        // Assign each Free time paragraph to its closest row
+        foreach ($freeParagraphs as $p) {
+            $closestRow = null;
+            $closestDist = PHP_INT_MAX;
+            foreach ($sortedRows as $rowIndex) {
+                $dist = abs($rowYPositions[$rowIndex] - $p['y']);
+                if ($dist < $closestDist && $dist < $yTolerance) {
+                    $closestDist = $dist;
+                    $closestRow = $rowIndex;
+                }
+            }
+            if ($closestRow !== null && empty($rowMetadata[$closestRow]['free'])) {
+                $rowMetadata[$closestRow]['free'] = $p['free'];
+            }
+        }
+
+        // Second pass: inherit from previous row ONLY for continuation rows (same route)
+        // Main rows (with POD in col 1) should NOT inherit from different routes
         $lastTt = '';
         $lastTs = '';
         $lastFree = '';
+        $lastPod = '';
         foreach ($sortedRows as $rowIndex) {
             $meta = &$rowMetadata[$rowIndex];
+            $cells = $tableCellsByRow[$rowIndex] ?? [];
 
-            // Check if this row is a "main" row (has more columns, including POD)
-            $colCount = count($tableCellsByRow[$rowIndex] ?? []);
+            // Check if this row is a "main" row (has POD in column 1)
+            $colCount = count($cells);
             $isMainRow = $colCount >= 4;
 
-            if ($isMainRow) {
-                // Main row - update last values if we have new data
+            // Get POD from column 1 (if exists)
+            $currentPod = isset($cells[1]) ? trim($cells[1]) : '';
+
+            if ($isMainRow && $currentPod && $currentPod !== $lastPod) {
+                // New route - reset last values, don't inherit from previous route
+                $lastTt = '';
+                $lastTs = '';
+                $lastFree = '';
+                $lastPod = $currentPod;
+
+                // Use this row's data as new last values
+                if ($meta['tt']) $lastTt = $meta['tt'];
+                if ($meta['ts']) $lastTs = $meta['ts'];
+                if ($meta['free']) $lastFree = $meta['free'];
+            } else {
+                // Continuation row or same route - can inherit
+                if (!$meta['tt'] && $lastTt) $meta['tt'] = $lastTt;
+                if (!$meta['ts'] && $lastTs) $meta['ts'] = $lastTs;
+                if (!$meta['free'] && $lastFree) $meta['free'] = $lastFree;
+
+                // Update last values
                 if ($meta['tt']) $lastTt = $meta['tt'];
                 if ($meta['ts']) $lastTs = $meta['ts'];
                 if ($meta['free']) $lastFree = $meta['free'];
             }
+        }
 
-            // Fill in missing values from previous row
-            if (!$meta['tt'] && $lastTt) $meta['tt'] = $lastTt;
-            if (!$meta['ts'] && $lastTs) $meta['ts'] = $lastTs;
-            if (!$meta['free'] && $lastFree) $meta['free'] = $lastFree;
+        // Third pass: propagate T/T from continuation row UP to main row (same route pair)
+        // This handles cases where the main row has no T/T but the continuation row does
+        $sortedRowsList = array_values($sortedRows);
+        for ($i = 0; $i < count($sortedRowsList) - 1; $i++) {
+            $rowIndex = $sortedRowsList[$i];
+            $nextRowIndex = $sortedRowsList[$i + 1];
 
-            // Update last values
-            if ($meta['tt']) $lastTt = $meta['tt'];
-            if ($meta['ts']) $lastTs = $meta['ts'];
-            if ($meta['free']) $lastFree = $meta['free'];
+            $cells = $tableCellsByRow[$rowIndex] ?? [];
+            $nextCells = $tableCellsByRow[$nextRowIndex] ?? [];
+
+            // Check if current is main row (has POD) and next is continuation (same POD or no POD)
+            $currentPod = isset($cells[1]) ? trim($cells[1]) : '';
+            $nextPod = isset($nextCells[1]) ? trim($nextCells[1]) : '';
+
+            // If next row has same POD or next row has fewer columns (continuation pattern)
+            $isContinuationPair = $currentPod && (count($nextCells) < count($cells) || $currentPod === $nextPod);
+
+            if ($isContinuationPair) {
+                // Propagate data UP from continuation to main if main is missing data
+                if (empty($rowMetadata[$rowIndex]['tt']) && !empty($rowMetadata[$nextRowIndex]['tt'])) {
+                    $rowMetadata[$rowIndex]['tt'] = $rowMetadata[$nextRowIndex]['tt'];
+                }
+                if (empty($rowMetadata[$rowIndex]['ts']) && !empty($rowMetadata[$nextRowIndex]['ts'])) {
+                    $rowMetadata[$rowIndex]['ts'] = $rowMetadata[$nextRowIndex]['ts'];
+                }
+                if (empty($rowMetadata[$rowIndex]['free']) && !empty($rowMetadata[$nextRowIndex]['free'])) {
+                    $rowMetadata[$rowIndex]['free'] = $rowMetadata[$nextRowIndex]['free'];
+                }
+            }
         }
 
         // Add metadata columns to merged cells
