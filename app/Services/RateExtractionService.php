@@ -464,10 +464,7 @@ class RateExtractionService
             $rate20 = $this->extractIalRate($colF);
             $rate40 = $this->extractIalRate($colG);
 
-            // Skip if both rates are empty or TBA
-            if ((empty($rate20) || $rate20 === 'TBA') && (empty($rate40) || $rate40 === 'TBA')) continue;
-
-            // Handle TBA rates - set to empty string for output
+            // Convert TBA to empty string for output, but don't skip TBA rows
             if ($rate20 === 'TBA') $rate20 = '';
             if ($rate40 === 'TBA') $rate40 = '';
 
