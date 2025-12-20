@@ -1305,9 +1305,22 @@ class RateExtractionService
             'INCHON' => 'Include LSS, EBS, CIS, CIC',
         ];
 
-        // Japan main ports surcharge from SITC remark #7
-        $japanMainPorts = ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya'];
-        $japanMainSurcharge = 'Include LSS';
+        // Japan main ports surcharge from SITC remark #7 (Osaka to Tomakomai)
+        $japanMainPorts = ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya', 'SAKAISENBOKU', 'MOJI', 'SHIMIZU', 'SENDAI', 'TOKUYAMA', 'HITACHINAKA', 'FUKUYAMA', 'YOKKAICHI', 'MIZUSHIMA', 'TAKAMATSU', 'HIROSHIMA', 'TOMAKOMAI', 'HACHINOHE'];
+        $japanMainSurcharge = 'INC FAF,YAS,LSS exclude AFS USD 30/set collect at Thailand side';
+
+        // DANANG surcharge from SITC remark #6
+        $danangSurcharge = "INC LSS exclude CIC Usd 50/20'GP Usd 100/40',40'HC collect at destination";
+
+        // N.MANILA / Batangas surcharge from SITC remark #8
+        $nManilaPorts = ['N.MANILA', 'BATANGAS'];
+        $nManilaSurcharge = "INC CAF,BAF,LSS,PSS,CIC,ECRS exclude IRF Usd 10/container collect at destination";
+
+        // S.MANILA surcharge from SITC remark #9
+        $sManilaSurcharge = "INC CAF,BAF,PSS,LSS exclude CIC USD 100/20' USD 200/40',40'HC ECRS USD100/20' USD 200/40',40'HC";
+
+        // TIANJIN (XINGANG) surcharge from SITC remark #11
+        $tianjinSurcharge = "INC CAF,BAF,LSS exclude TTS RMB100/20'GP RMB150/40',40'HC & CIS USD 50/20'GP USD 100/40',40'HC collect at destination";
 
         // Malaysia T/S ports (Kuching, Bintulu) - no specific surcharge in remark
         $malaysiaTSPorts = ['Kuching', 'Sarawak', 'Bintulu'];
@@ -1906,6 +1919,29 @@ class RateExtractionService
                         $surcharge = ''; // Clear any inherited surcharge
                         break;
                     }
+                }
+
+                // Check DANANG (remark #6)
+                if (stripos($pod, 'DANANG') !== false) {
+                    $surcharge = $danangSurcharge;
+                }
+
+                // Check N.MANILA / Batangas (remark #8)
+                foreach ($nManilaPorts as $nManilaPort) {
+                    if (stripos($pod, $nManilaPort) !== false) {
+                        $surcharge = $nManilaSurcharge;
+                        break;
+                    }
+                }
+
+                // Check S.MANILA (remark #9)
+                if (stripos($pod, 'S.MANILA') !== false || preg_match('/^S\.?\s*MANILA$/i', $pod)) {
+                    $surcharge = $sManilaSurcharge;
+                }
+
+                // Check TIANJIN/XINGANG (remark #11)
+                if (stripos($pod, 'TIANJIN') !== false || stripos($pod, 'XINGANG') !== false) {
+                    $surcharge = $tianjinSurcharge;
                 }
             }
 
