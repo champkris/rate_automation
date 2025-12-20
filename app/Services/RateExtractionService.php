@@ -24,6 +24,7 @@ class RateExtractionService
         'sm_line' => 'SM LINE',
         'dongjin' => 'DONGJIN',
         'ts_line' => 'TS LINE',
+        'ial' => 'IAL (Inter Asia Line)',
         'generic' => 'Generic Excel (auto-detect columns)',
     ];
 
@@ -86,6 +87,7 @@ class RateExtractionService
         if (preg_match('/SM.?LINE/i', $filename)) return 'sm_line';
         if (preg_match('/DONGJIN/i', $filename)) return 'dongjin';
         if (preg_match('/TS.?LINE|RATE.?1ST/i', $filename)) return 'ts_line';
+        if (preg_match('/INTER.?ASIA|IAL/i', $filename)) return 'ial';
 
         return 'generic';
     }
@@ -147,6 +149,7 @@ class RateExtractionService
             'boxman' => $this->parseBoxmanExcel($worksheet, $validity),
             'sitc' => $this->parseSitcExcel($worksheet, $validity),
             'wanhai' => $this->parseWanhaiExcel($worksheet, $validity),
+            'ial' => $this->parseIalExcel($worksheet, $validity),
             default => $this->parseGenericExcel($worksheet, $validity),
         };
     }
@@ -405,6 +408,145 @@ class RateExtractionService
     protected function parseWanhaiExcel($worksheet, string $validity): array
     {
         return $this->parseGenericExcel($worksheet, $validity, 'WANHAI');
+    }
+
+    /**
+     * Parse IAL (Inter Asia Line) Excel format
+     *
+     * IAL format has fixed columns:
+     * A: POL, B: POD, C: Service Name, D: T/T days, E: Direct/TS, F: 20', G: 40'/HC, H: REMARK
+     * Row 1-2 are headers, Row 3+ are country headers or data rows
+     * Country headers have only column A filled (e.g., "SOUTH AFRICA", "CHINA")
+     */
+    protected function parseIalExcel($worksheet, string $validity): array
+    {
+        $rates = [];
+        $highestRow = $worksheet->getHighestDataRow();
+
+        // Extract validity from remarks if not provided (e.g., "Validity: 1-15 JAN 2026")
+        if (empty($validity)) {
+            for ($row = 1; $row <= $highestRow; $row++) {
+                $cellA = trim($worksheet->getCell('A' . $row)->getCalculatedValue() ?? '');
+                if (preg_match('/Validity[:\s]*(.+)/i', $cellA, $match)) {
+                    $validity = strtoupper(trim($match[1]));
+                    break;
+                }
+            }
+        }
+
+        if (empty($validity)) {
+            $validity = strtoupper(date('M Y'));
+        }
+
+        // Process data rows (skip header rows 1-2)
+        for ($row = 3; $row <= $highestRow; $row++) {
+            $colA = trim($worksheet->getCell('A' . $row)->getCalculatedValue() ?? '');
+            $colB = trim($worksheet->getCell('B' . $row)->getCalculatedValue() ?? '');
+            $colC = trim($worksheet->getCell('C' . $row)->getCalculatedValue() ?? '');
+            $colD = trim($worksheet->getCell('D' . $row)->getCalculatedValue() ?? '');
+            $colE = trim($worksheet->getCell('E' . $row)->getCalculatedValue() ?? '');
+            $colF = trim($worksheet->getCell('F' . $row)->getCalculatedValue() ?? '');
+            $colG = trim($worksheet->getCell('G' . $row)->getCalculatedValue() ?? '');
+            $colH = trim($worksheet->getCell('H' . $row)->getCalculatedValue() ?? '');
+
+            // Skip empty rows
+            if (empty($colA)) continue;
+
+            // Skip country header rows (only column A has content, B is empty)
+            // Also skip remark/note rows (start with "*" or "Remark")
+            if (empty($colB) || preg_match('/^\*|^Remark/i', $colA)) continue;
+
+            // Skip local charges section (starts with "POL's Local charge" or similar)
+            if (preg_match('/Local.?charge|THC|CFS|B\/L|Telex|Seal/i', $colA)) continue;
+
+            // Extract rates - handle formats like "$30", "$600", "$1,200", "TBA", etc.
+            // Strip $ and comma from rates before extracting numeric value
+            $rate20 = $this->extractIalRate($colF);
+            $rate40 = $this->extractIalRate($colG);
+
+            // Skip if both rates are empty or TBA
+            if ((empty($rate20) || $rate20 === 'TBA') && (empty($rate40) || $rate40 === 'TBA')) continue;
+
+            // Handle TBA rates - set to empty string for output
+            if ($rate20 === 'TBA') $rate20 = '';
+            if ($rate40 === 'TBA') $rate40 = '';
+
+            // Normalize POL (BKK/LCH format)
+            $pol = $this->normalizeIalPol($colA);
+
+            // POD is in column B
+            $pod = $colB;
+
+            // T/T is in column D
+            $tt = $colD ?: 'TBA';
+
+            // T/S is in column E (Direct, T/S at xxx, Via xxx)
+            $ts = $colE ?: 'TBA';
+
+            // Remark is in column H
+            $remark = $colH;
+
+            $rates[] = $this->createRateEntry(
+                'IAL',
+                $pol,
+                $pod,
+                $rate20,
+                $rate40,
+                [
+                    'T/T' => $tt,
+                    'T/S' => $ts,
+                    'FREE TIME' => 'TBA',
+                    'VALIDITY' => $validity,
+                    'REMARK' => $remark,
+                ]
+            );
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Normalize IAL POL format
+     * Converts "BKK/LCH" or "LCH" to standard format
+     */
+    protected function normalizeIalPol(string $pol): string
+    {
+        $pol = strtoupper(trim($pol));
+
+        // Map common abbreviations
+        $polMappings = [
+            'BKK/LCH' => 'BKK/LCH',
+            'LCH' => 'LCH',
+            'BKK' => 'BKK',
+            'LKA' => 'LKA',
+        ];
+
+        return $polMappings[$pol] ?? $pol;
+    }
+
+    /**
+     * Extract numeric rate from IAL format
+     * Handles formats like "$30", "$600", "$1,200", "TBA", empty, etc.
+     */
+    protected function extractIalRate(string $cell): string
+    {
+        $cell = trim($cell);
+
+        // Return TBA for TBA values
+        if (empty($cell) || preg_match('/^TBA$/i', $cell)) {
+            return 'TBA';
+        }
+
+        // Strip $ and commas, then extract numeric value
+        $cell = str_replace(['$', ','], '', $cell);
+        $cell = trim($cell);
+
+        // Extract numeric value
+        if (preg_match('/^(\d+)/', $cell, $match)) {
+            return $match[1];
+        }
+
+        return '';
     }
 
     /**
