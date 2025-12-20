@@ -1310,7 +1310,7 @@ class RateExtractionService
         $japanMainSurcharge = 'INC FAF,YAS,LSS exclude AFS USD 30/set collect at Thailand side';
 
         // DANANG surcharge from SITC remark #6
-        $danangSurcharge = "INC LSS exclude CIC Usd 50/20'GP Usd 100/40',40'HC collect at destination";
+        $danangSurcharge = "INC CAF,BAF,LSS exclude CIC 50/100 collect at destination (please recheck with pod agent once shipment arrival at destination may be change without notice)";
 
         // N.MANILA / Batangas surcharge from SITC remark #8
         $nManilaPorts = ['N.MANILA', 'BATANGAS'];
