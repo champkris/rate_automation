@@ -226,7 +226,7 @@ class RateExtractionService
             'sinokor_skr' => $this->parseSinokorSkrTable($lines, $validity),
             'heung_a' => $this->parseHeungATable($lines, $validity),
             'boxman' => $this->parseBoxmanTable($lines, $validity),
-            'sitc' => $this->parseSitcTable($lines, $validity),
+            'sitc' => $this->parseSitcTable($lines, $validity, $jsonFile),
             'wanhai' => $this->parseWanhaiTable($lines, $validity, $jsonFile),
             'ts_line' => $this->parseTsLineTable($lines, $validity),
             'dongjin' => $this->parseDongjinTable($lines, $validity),
@@ -1280,7 +1280,7 @@ class RateExtractionService
      * After table merging, TABLE 1 now contains full row data including T/T, T/S, Free time.
      * TABLE 2 is a separate table (continuation of different routes), also with merged columns.
      */
-    protected function parseSitcTable(array $lines, string $validity): array
+    protected function parseSitcTable(array $lines, string $validity, string $jsonFile = ''): array
     {
         $rates = [];
         $currentTable = 0;
@@ -1294,33 +1294,14 @@ class RateExtractionService
         $lastTS = 'TBA';
         $podSurcharge = []; // Track surcharge by POD for merged cells
 
-        // Country/region-specific surcharges from SITC remarks (for TABLE 4 ports without surcharge column)
-        // Indonesia ports surcharge from SITC remark #15
-        $indonesiaPorts = ['Jakarta', 'NPCT1', 'Cikarang', 'CKD', 'Semarang', 'Makassar', 'Batam', 'Surabaya', 'Balikpapan'];
-        $indonesiaSurcharge = "INC LSS exclude CIC Usd 20/20'GP 30/40',40'HC collect at destination";
+        // Extract POD-specific remarks from Azure OCR JSON paragraphs
+        $podRemarks = $this->extractSitcPodRemarks($jsonFile);
 
-        // Korea ports surcharges (from OCR data)
+        // Korea ports surcharges (from OCR data - not in numbered remarks)
         $koreaSurcharges = [
             'BUSAN' => 'Include LSS, EBS, CIS',
             'INCHON' => 'Include LSS, EBS, CIS, CIC',
         ];
-
-        // Japan main ports surcharge from SITC remark #7 (Osaka to Tomakomai)
-        $japanMainPorts = ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya', 'SAKAISENBOKU', 'MOJI', 'SHIMIZU', 'SENDAI', 'TOKUYAMA', 'HITACHINAKA', 'FUKUYAMA', 'YOKKAICHI', 'MIZUSHIMA', 'TAKAMATSU', 'HIROSHIMA', 'TOMAKOMAI', 'HACHINOHE'];
-        $japanMainSurcharge = 'INC FAF,YAS,LSS exclude AFS (Advance filing manifest surcharge Japan rules 24 hrs). USD 30/set collect at Thailand side. For Tokyo/Osaka have EMC/CIC at destination, please recheck with our pod agent once shipment arrival at destination.';
-
-        // DANANG surcharge from SITC remark #6
-        $danangSurcharge = "INC CAF,BAF,LSS exclude CIC 50/100 collect at destination (please recheck with pod agent once shipment arrival at destination may be change without notice)";
-
-        // N.MANILA / Batangas surcharge from SITC remark #8
-        $nManilaPorts = ['N.MANILA', 'BATANGAS'];
-        $nManilaSurcharge = "INC CAF,BAF,LSS,PSS,CIC,ECRS exclude IRF Usd 10/container collect at destination";
-
-        // S.MANILA surcharge from SITC remark #9
-        $sManilaSurcharge = "INC CAF,BAF,PSS,LSS exclude CIC USD 100/20' USD 200/40',40'HC ECRS USD100/20' USD 200/40',40'HC";
-
-        // TIANJIN (XINGANG) surcharge from SITC remark #11
-        $tianjinSurcharge = "INC CAF,BAF,LSS exclude TTS RMB100/20'GP RMB150/40',40'HC & CIS USD 50/20'GP USD 100/40',40'HC collect at destination";
 
         // Malaysia T/S ports (Kuching, Bintulu) - no specific surcharge in remark
         $malaysiaTSPorts = ['Kuching', 'Sarawak', 'Bintulu'];
@@ -1878,23 +1859,23 @@ class RateExtractionService
             // Skip surcharge values that are just numbers (T/T, days, etc.) or T/S notes
             $remark = $serviceRoute;
 
-            // For TABLE 4+ ports without surcharge column, apply country/region-specific surcharges
+            // For TABLE 4+ ports without surcharge column, apply POD-specific surcharges from remarks
             // Only apply if no surcharge was found in the table or if it's just from forward propagation
             $needsCountrySurcharge = $isTable3Plus && (empty($surcharge) || $surcharge === $lastSurcharge);
 
             if ($needsCountrySurcharge) {
-                // Check Indonesia ports (remark #15)
-                $isIndonesiaPort = false;
-                foreach ($indonesiaPorts as $indoPort) {
-                    if (stripos($pod, $indoPort) !== false) {
-                        $isIndonesiaPort = true;
-                        $surcharge = $indonesiaSurcharge;
+                // Check Malaysia T/S ports - no surcharge, clear inherited value
+                $isMalaysiaPort = false;
+                foreach ($malaysiaTSPorts as $malaysiaPort) {
+                    if (stripos($pod, $malaysiaPort) !== false) {
+                        $surcharge = ''; // Clear any inherited surcharge
+                        $isMalaysiaPort = true;
                         break;
                     }
                 }
 
-                // Check Korea ports
-                if (!$isIndonesiaPort) {
+                // Check Korea ports (not in numbered remarks)
+                if (!$isMalaysiaPort) {
                     foreach ($koreaSurcharges as $koreaPort => $koreaSurcharge) {
                         if (stripos($pod, $koreaPort) !== false) {
                             $surcharge = $koreaSurcharge;
@@ -1903,45 +1884,14 @@ class RateExtractionService
                     }
                 }
 
-                // Check Japan main ports (remark #7)
-                if (!$isIndonesiaPort && !isset($koreaSurcharges[strtoupper($pod)])) {
-                    foreach ($japanMainPorts as $japanPort) {
-                        if (stripos($pod, $japanPort) !== false) {
-                            $surcharge = $japanMainSurcharge;
+                // Apply POD-specific remarks from the PDF (dynamically extracted)
+                if (!$isMalaysiaPort && !isset($koreaSurcharges[strtoupper($pod)])) {
+                    foreach ($podRemarks as $podPattern => $remarkText) {
+                        if (stripos($pod, $podPattern) !== false) {
+                            $surcharge = $remarkText;
                             break;
                         }
                     }
-                }
-
-                // Check Malaysia T/S ports - no surcharge, clear inherited value
-                foreach ($malaysiaTSPorts as $malaysiaPort) {
-                    if (stripos($pod, $malaysiaPort) !== false) {
-                        $surcharge = ''; // Clear any inherited surcharge
-                        break;
-                    }
-                }
-
-                // Check DANANG (remark #6)
-                if (stripos($pod, 'DANANG') !== false) {
-                    $surcharge = $danangSurcharge;
-                }
-
-                // Check N.MANILA / Batangas (remark #8)
-                foreach ($nManilaPorts as $nManilaPort) {
-                    if (stripos($pod, $nManilaPort) !== false) {
-                        $surcharge = $nManilaSurcharge;
-                        break;
-                    }
-                }
-
-                // Check S.MANILA (remark #9)
-                if (stripos($pod, 'S.MANILA') !== false || preg_match('/^S\.?\s*MANILA$/i', $pod)) {
-                    $surcharge = $sManilaSurcharge;
-                }
-
-                // Check TIANJIN/XINGANG (remark #11)
-                if (stripos($pod, 'TIANJIN') !== false || stripos($pod, 'XINGANG') !== false) {
-                    $surcharge = $tianjinSurcharge;
                 }
             }
 
@@ -1959,6 +1909,80 @@ class RateExtractionService
         }
 
         return $rates;
+    }
+
+    /**
+     * Extract POD-specific remarks from SITC Azure OCR JSON paragraphs
+     * Parses numbered remarks like "6. DANANG include CAF,BAF,LSS..."
+     * Returns array of POD pattern => remark text
+     */
+    protected function extractSitcPodRemarks(string $jsonFile): array
+    {
+        $podRemarks = [];
+
+        if (empty($jsonFile) || !file_exists($jsonFile)) {
+            return $podRemarks;
+        }
+
+        $data = json_decode(file_get_contents($jsonFile), true);
+        if (!$data || !isset($data['analyzeResult']['paragraphs'])) {
+            return $podRemarks;
+        }
+
+        // POD pattern mappings - maps remark keywords to POD patterns to match
+        $podMappings = [
+            'DANANG' => ['DANANG'],
+            'JAPAN MAIN PORT' => ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya', 'SAKAISENBOKU', 'MOJI', 'SHIMIZU', 'SENDAI', 'TOKUYAMA', 'HITACHINAKA', 'FUKUYAMA', 'YOKKAICHI', 'MIZUSHIMA', 'TAKAMATSU', 'HIROSHIMA', 'TOMAKOMAI', 'HACHINOHE'],
+            'N.MANILA' => ['N.MANILA'],
+            'Batangas' => ['BATANGAS'],
+            'S.MANILA' => ['S.MANILA'],
+            'XINGANG' => ['TIANJIN', 'XINGANG'],
+            'DAESAN' => ['DAESAN'],
+            'CEBU' => ['CEBU'],
+            'CAGAYAN' => ['CAGAYAN'],
+            'DAVAO' => ['DAVAO'],
+            'SUBIC' => ['SUBIC'],
+            'Indonesia' => ['Jakarta', 'NPCT1', 'Cikarang', 'CKD', 'Semarang', 'Makassar', 'Batam', 'Surabaya', 'Balikpapan'],
+        ];
+
+        $inRemarks = false;
+        foreach ($data['analyzeResult']['paragraphs'] as $para) {
+            $content = $para['content'] ?? '';
+
+            // Start capturing after REMARKS header
+            if (preg_match('/^REMARKS\s*:/i', $content)) {
+                $inRemarks = true;
+                continue;
+            }
+
+            // Capture numbered remarks (6. xxx, 7. xxx, etc.)
+            if ($inRemarks && preg_match('/^\d+\.\s+(.+)/', $content, $match)) {
+                $remarkText = trim($match[1]);
+
+                // Find which POD(s) this remark applies to
+                foreach ($podMappings as $keyword => $podPatterns) {
+                    if (stripos($remarkText, $keyword) !== false) {
+                        // Extract the remark content after the POD name
+                        // E.g., "DANANG include CAF,BAF,LSS..." -> "INC CAF,BAF,LSS..."
+                        $remarkContent = $remarkText;
+
+                        // Clean up: replace "include" with "INC" for consistency
+                        $remarkContent = preg_replace('/\binclude\b/i', 'INC', $remarkContent);
+
+                        // Remove the POD name prefix if present
+                        $remarkContent = preg_replace('/^[A-Z\.\s\/\(\)]+\s*(INC|include|exclude)/i', '$1', $remarkContent);
+
+                        // Apply to all POD patterns for this keyword
+                        foreach ($podPatterns as $podPattern) {
+                            $podRemarks[$podPattern] = trim($remarkContent);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $podRemarks;
     }
 
     /**
