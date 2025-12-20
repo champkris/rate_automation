@@ -1307,7 +1307,7 @@ class RateExtractionService
 
         // Japan main ports surcharge from SITC remark #7 (Osaka to Tomakomai)
         $japanMainPorts = ['OSAKA', 'KOBE', 'KAWASAKI', 'NGO', 'TOKYO', 'YOKO', 'HAKATA', 'Nagoya', 'SAKAISENBOKU', 'MOJI', 'SHIMIZU', 'SENDAI', 'TOKUYAMA', 'HITACHINAKA', 'FUKUYAMA', 'YOKKAICHI', 'MIZUSHIMA', 'TAKAMATSU', 'HIROSHIMA', 'TOMAKOMAI', 'HACHINOHE'];
-        $japanMainSurcharge = 'INC FAF,YAS,LSS exclude AFS USD 30/set collect at Thailand side';
+        $japanMainSurcharge = 'INC FAF,YAS,LSS exclude AFS (Advance filing manifest surcharge Japan rules 24 hrs). USD 30/set collect at Thailand side. For Tokyo/Osaka have EMC/CIC at destination, please recheck with our pod agent once shipment arrival at destination.';
 
         // DANANG surcharge from SITC remark #6
         $danangSurcharge = "INC CAF,BAF,LSS exclude CIC 50/100 collect at destination (please recheck with pod agent once shipment arrival at destination may be change without notice)";
