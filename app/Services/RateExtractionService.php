@@ -484,7 +484,7 @@ class RateExtractionService
             $remark = $colH;
 
             $rates[] = $this->createRateEntry(
-                'IAL',
+                'Inter Asia',
                 $pol,
                 $pod,
                 $rate20,

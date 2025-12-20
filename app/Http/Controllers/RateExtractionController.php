@@ -245,7 +245,7 @@ class RateExtractionController extends Controller
             'sm_line' => 'SM_LINE',
             'dongjin' => 'DONGJIN',
             'ts_line' => 'TS_LINE',
-            'ial' => 'IAL',
+            'ial' => 'INTER_ASIA',
         ];
 
         // If pattern is auto, detect from filename
@@ -266,7 +266,7 @@ class RateExtractionController extends Controller
             if (preg_match('/CK\s*LINE/i', $filename)) return 'CK_LINE';
             if (preg_match('/SM\s*LINE/i', $filename)) return 'SM_LINE';
             if (preg_match('/DONGJIN/i', $filename)) return 'DONGJIN';
-            if (preg_match('/INTER.?ASIA|IAL/i', $filename)) return 'IAL';
+            if (preg_match('/INTER.?ASIA|IAL/i', $filename)) return 'INTER_ASIA';
 
             // Generic patterns (should be checked AFTER specific carrier names)
             if (preg_match('/UPDATED.?RATE/i', $filename)) return 'KMTC';
