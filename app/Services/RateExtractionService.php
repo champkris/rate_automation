@@ -395,6 +395,29 @@ class RateExtractionService
         $rates = [];
         $highestRow = $worksheet->getHighestDataRow();
 
+        // Unmerge and fill down POD Country column (B) to handle merged cells
+        $this->unmergePodCountryColumn($worksheet, $highestRow);
+
+        // Extract notices once at the beginning
+        $notices = $this->extractKmtcNotices($worksheet);
+
+        // Check which notices are present
+        $hasAfsNotice = false;
+        $hasLssNotice = false;
+        $afsNoticeText = '';
+        $lssNoticeText = '';
+
+        foreach ($notices as $notice) {
+            if (stripos($notice, 'AFS charge') !== false && stripos($notice, 'JP&CN') !== false) {
+                $hasAfsNotice = true;
+                $afsNoticeText = $notice;
+            }
+            if (stripos($notice, 'subject to origin LSS') !== false) {
+                $hasLssNotice = true;
+                $lssNoticeText = $notice;
+            }
+        }
+
         for ($row = 6; $row <= $highestRow; $row++) {
             $country = trim($worksheet->getCell('B' . $row)->getValue() ?? '');
             $pol = trim($worksheet->getCell('C' . $row)->getValue() ?? '');
@@ -416,14 +439,67 @@ class RateExtractionService
                 $rowValidity = strtoupper(date('M Y'));
             }
 
+            // Apply conditional remark logic
+            $remark = '';
+
+            // Priority 1: AFS charge notice (only for China/Japan)
+            if ($hasAfsNotice) {
+                $countryUpper = strtoupper($country);
+                if (stripos($countryUpper, 'CHINA') !== false || stripos($countryUpper, 'JAPAN') !== false) {
+                    $remark = $afsNoticeText;
+                }
+            }
+
+            // Priority 2: LSS notice (fallback if remark still empty)
+            if (empty($remark) && $hasLssNotice) {
+                $remark = $lssNoticeText;
+            }
+
+            // If no notice matched, remark remains empty string
+
             $rates[] = $this->createRateEntry('KMTC', $pol ?: 'BKK/LCH', $podArea, $rate20, $rate40, [
                 'FREE TIME' => $freeTime,
                 'VALIDITY' => $rowValidity,
-                'REMARK' => $country,
+                'REMARK' => $remark,
             ]);
         }
 
         return $rates;
+    }
+
+    /**
+     * Unmerge POD Country column (B) and fill down values
+     * This handles merged cells so all rows get the country value
+     *
+     * @param $worksheet PhpSpreadsheet worksheet object
+     * @param int $highestRow Highest row number with data
+     */
+    protected function unmergePodCountryColumn($worksheet, int $highestRow): void
+    {
+        // Get all merged cell ranges
+        $mergedCells = $worksheet->getMergeCells();
+
+        // Find and unmerge cells in column B
+        foreach ($mergedCells as $mergedRange) {
+            // Check if this merge range is in column B
+            if (strpos($mergedRange, 'B') === 0) {
+                // Get the value from the first cell before unmerging
+                $firstCell = explode(':', $mergedRange)[0];
+                $value = $worksheet->getCell($firstCell)->getValue();
+
+                // Unmerge the cells
+                $worksheet->unmergeCells($mergedRange);
+
+                // Fill down the value to all cells in the range
+                list($startCell, $endCell) = explode(':', $mergedRange);
+                $startRow = (int) filter_var($startCell, FILTER_SANITIZE_NUMBER_INT);
+                $endRow = (int) filter_var($endCell, FILTER_SANITIZE_NUMBER_INT);
+
+                for ($row = $startRow; $row <= $endRow; $row++) {
+                    $worksheet->setCellValue('B' . $row, $value);
+                }
+            }
+        }
     }
 
     /**
@@ -439,6 +515,54 @@ class RateExtractionService
         // Add current year
         $year = date('Y');
         return strtoupper(trim($validCol) . ' ' . $year);
+    }
+
+    /**
+     * Extract notice messages from KMTC Excel file
+     * Looks for text below the "...Notice..." row
+     *
+     * @param $worksheet PhpSpreadsheet worksheet object
+     * @return array Array of notice strings found
+     */
+    protected function extractKmtcNotices($worksheet): array
+    {
+        $notices = [];
+        $highestRow = $worksheet->getHighestDataRow();
+        $noticeRowFound = false;
+        $noticeStartRow = 0;
+
+        // Find the "...Notice..." row - check all columns A through K
+        for ($row = 1; $row <= $highestRow; $row++) {
+            for ($col = 'A'; $col <= 'K'; $col++) {
+                $cellValue = trim($worksheet->getCell($col . $row)->getValue() ?? '');
+
+                // Check if this cell contains "Notice" (case-insensitive)
+                if (stripos($cellValue, 'Notice') !== false) {
+                    $noticeRowFound = true;
+                    $noticeStartRow = $row + 1; // Start reading from next row
+                    break 2; // Break out of both loops
+                }
+            }
+        }
+
+        // If notice row found, extract all text below it
+        if ($noticeRowFound) {
+            for ($row = $noticeStartRow; $row <= $highestRow; $row++) {
+                // Check all columns for notice text (A through K)
+                for ($col = 'A'; $col <= 'K'; $col++) {
+                    $cellValue = trim($worksheet->getCell($col . $row)->getValue() ?? '');
+
+                    if (!empty($cellValue)) {
+                        // Add to notices if it's not already there
+                        if (!in_array($cellValue, $notices)) {
+                            $notices[] = $cellValue;
+                        }
+                    }
+                }
+            }
+        }
+
+        return $notices;
     }
 
     /**
