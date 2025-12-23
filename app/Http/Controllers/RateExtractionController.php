@@ -41,23 +41,31 @@ class RateExtractionController extends Controller
         $pattern = $request->input('pattern');
         $validity = $request->input('validity') ?? '';
 
-        // Store the file temporarily - sanitize filename to remove spaces
+        // Store the file temporarily - sanitize filename to remove spaces and special characters
         $originalName = $file->getClientOriginalName();
-        $sanitizedName = preg_replace('/[^a-zA-Z0-9._-]/', '_', $originalName);
-        $filename = time() . '_' . $sanitizedName;
+        $extension = $file->getClientOriginalExtension();
+        // Keep only safe ASCII characters and preserve extension
+        $sanitizedName = preg_replace('/[^a-zA-Z0-9._-]/', '_', pathinfo($originalName, PATHINFO_FILENAME));
+        $filename = time() . '_' . $sanitizedName . '.' . $extension;
 
-        // Ensure temp directory exists
-        $tempDir = storage_path('app/temp_uploads');
-        if (!is_dir($tempDir)) {
-            mkdir($tempDir, 0755, true);
-        }
+        // Use Laravel's storage system which handles Unicode paths better
+        try {
+            // Store using Laravel's Storage facade (handles Unicode better)
+            $storedPath = $file->storeAs('temp_uploads', $filename, 'local');
 
-        // Move file directly instead of using storeAs
-        $fullPath = $tempDir . '/' . $filename;
-        $file->move($tempDir, $filename);
+            // Get the real path - Storage::path() handles the local disk properly
+            $fullPath = Storage::disk('local')->path($storedPath);
 
-        if (!file_exists($fullPath)) {
-            return back()->with('error', 'Failed to upload file. Please try again.');
+            // Verify file was stored
+            if (!Storage::disk('local')->exists($storedPath)) {
+                \Log::error('File upload failed: File not found after storage - ' . $storedPath);
+                return back()->with('error', 'Failed to upload file. Please try again.');
+            }
+
+            \Log::info('File uploaded successfully: ' . $fullPath);
+        } catch (\Exception $e) {
+            \Log::error('File upload exception: ' . $e->getMessage() . ' | Trace: ' . $e->getTraceAsString());
+            return back()->with('error', 'Failed to upload file: ' . $e->getMessage());
         }
 
         try {

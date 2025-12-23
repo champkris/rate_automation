@@ -46,7 +46,17 @@ class RateExtractionService
 
         // Auto-detect pattern from filename if empty or set to 'auto'
         if ($pattern === '' || $pattern === 'auto') {
+            // Step 1: Try filename detection first (fast, works for most cases)
             $pattern = $this->detectPatternFromFilename($filename);
+
+            // Step 2: If filename detection failed or returned generic, try logo detection
+            // This catches cases like KMTC files with typo filenames
+            if (($pattern === 'generic' || $pattern === 'kmtc') && $extension !== 'pdf') {
+                $logoPattern = $this->detectPatternByLogo($filePath);
+                if ($logoPattern !== null) {
+                    $pattern = $logoPattern; // Override with logo detection result
+                }
+            }
         } else {
             // Normalize pattern to lowercase for case-insensitive matching
             $pattern = strtolower($pattern);
@@ -90,6 +100,68 @@ class RateExtractionService
         if (preg_match('/INTER.?ASIA|IAL/i', $filename)) return 'ial';
 
         return 'generic';
+    }
+
+    /**
+     * Detect KMTC pattern by analyzing embedded logo image
+     *
+     * KMTC logo characteristics:
+     * - Position: Header area (columns D-G, rows 1-3)
+     * - Aspect Ratio: Width/Height ≈ 3.16 (±0.4 tolerance)
+     *
+     * @param string $filePath Full path to Excel file
+     * @return string|null 'kmtc' if detected, null otherwise
+     */
+    protected function detectPatternByLogo(string $filePath): ?string
+    {
+        try {
+            // Only process Excel files
+            if (!preg_match('/\.(xlsx|xls)$/i', $filePath)) {
+                return null;
+            }
+
+            $spreadsheet = IOFactory::load($filePath);
+            $sheet = $spreadsheet->getActiveSheet();
+            $drawings = $sheet->getDrawingCollection();
+
+            if (count($drawings) === 0) {
+                return null; // No images = not KMTC
+            }
+
+            // KMTC logo characteristics
+            $kmtcAspectRatio = 218 / 69;  // ≈ 3.16 (width / height)
+            $tolerance = 0.4;              // Allow ±0.4 difference
+
+            // Check each image in the file
+            foreach ($drawings as $image) {
+                $position = $image->getCoordinates();
+                $width = $image->getWidth();
+                $height = $image->getHeight();
+
+                // Condition 1: Position in header area (columns D-G, rows 1-3)
+                $isHeaderPosition = preg_match('/^[DEFG][1-3]$/', $position);
+                if (!$isHeaderPosition) {
+                    continue; // Skip images not in header
+                }
+
+                // Condition 2: Aspect ratio matches KMTC logo
+                $aspectRatio = $width / $height;
+                $ratioDifference = abs($aspectRatio - $kmtcAspectRatio);
+                $ratioMatches = $ratioDifference <= $tolerance;
+
+                // If both conditions met, this is KMTC
+                if ($ratioMatches) {
+                    return 'kmtc';
+                }
+            }
+
+            return null; // No matching logo found
+
+        } catch (\Exception $e) {
+            // If error reading file, return null (will fall back to filename detection)
+            \Log::debug("Logo detection failed for {$filePath}: " . $e->getMessage());
+            return null;
+        }
     }
 
     /**
