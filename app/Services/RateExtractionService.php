@@ -14,6 +14,7 @@ class RateExtractionService
         'auto' => 'Auto-detect from filename',
         'rcl' => 'RCL (FAK Rate)',
         'kmtc' => 'KMTC (Updated Rate)',
+        'pil' => 'PIL (Pacific International Lines)',
         'sinokor' => 'SINOKOR (Main Rate Card)',
         'sinokor_skr' => 'SINOKOR SKR (HK Feederage)',
         'heung_a' => 'HEUNG A',
@@ -81,6 +82,7 @@ class RateExtractionService
         // Use .? to match optional space, underscore, or hyphen
         if (preg_match('/FAK.?RATE.?OF/i', $filename)) return 'rcl';
         if (preg_match('/UPDATED.?RATE/i', $filename)) return 'kmtc';
+        if (preg_match('/PIL.*QUOTATION|QUOTATION.*PIL|PIL.*(AFRICA|INTRA ASIA|LATIN AMERICA|OCEANIA|SOUTH ASIA)/i', $filename)) return 'pil';
         // Check SKR pattern before generic SINOKOR (SKR is the HK feederage table)
         if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) return 'sinokor_skr';
         // "GUIDE RATE FOR" with "(SKR)" or "_SKR_" is regular SINOKOR format (not feederage)
@@ -171,6 +173,12 @@ class RateExtractionService
     {
         $content = implode("\n", array_slice($lines, 0, 30)); // Check first 30 lines
 
+        // PIL signature: "Pacific International Lines" company name and trade regions
+        if (preg_match('/Pacific International Lines/i', $content) ||
+            preg_match('/Trade\s*:\s*(Africa|Intra Asia|Latin America|Oceania|South Asia)/i', $content)) {
+            return 'pil';
+        }
+
         // SITC signature: "Service Route" column header or SITC service codes (VTX, CKV, JTH)
         if (preg_match('/Service Route/i', $content) || preg_match('/\b(VTX\d|CKV\d|JTH)\b/i', $content)) {
             return 'sitc';
@@ -245,6 +253,19 @@ class RateExtractionService
             if (empty($validity) && file_exists($jsonFile)) {
                 $validity = $this->extractValidityFromJson($jsonFile);
             }
+
+            // For PIL carrier: add Trade field from JSON or filename to help region detection
+            if ($pattern === 'pil' && file_exists($jsonFile)) {
+                $jsonContent = file_get_contents($jsonFile);
+                // Try to extract Trade field from JSON
+                if (preg_match('/"content":\s*"Trade:\s*([^"]+)"/i', $jsonContent, $matches)) {
+                    // Prepend Trade field as first line for region detection
+                    array_unshift($lines, "Trade: " . trim($matches[1]));
+                } elseif (preg_match('/(Africa|Intra Asia|Latin America|Oceania|South Asia)/i', $baseFilename, $matches)) {
+                    // Fallback: detect region from filename
+                    array_unshift($lines, "Trade: " . $matches[1]);
+                }
+            }
         } else {
             // No cached results - run Azure OCR on-the-fly
             $azureOcr = new AzureOcrService();
@@ -275,6 +296,18 @@ class RateExtractionService
                 $validity = $azureOcr->extractValidityFromResult($azureResult);
             }
 
+            // For PIL carrier: add Trade field from OCR result to help region detection
+            if ($pattern === 'pil') {
+                $fullText = $azureOcr->extractFullTextFromResult($azureResult);
+                if (preg_match('/Trade:\s*([^\n]+)/i', $fullText, $matches)) {
+                    // Prepend Trade field as first line for region detection
+                    array_unshift($lines, "Trade: " . trim($matches[1]));
+                } elseif (preg_match('/(Africa|Intra Asia|Latin America|Oceania|South Asia)/i', $baseFilename, $matches)) {
+                    // Fallback: detect region from filename
+                    array_unshift($lines, "Trade: " . $matches[1]);
+                }
+            }
+
             // Cache the results for future use
             if (!is_dir($azureResultsDir)) {
                 mkdir($azureResultsDir, 0755, true);
@@ -294,6 +327,7 @@ class RateExtractionService
         }
 
         return match ($pattern) {
+            'pil' => $this->parsePilTable($lines, $validity),
             'sinokor' => $this->parseSinokorTable($lines, $validity),
             'sinokor_skr' => $this->parseSinokorSkrTable($lines, $validity),
             'heung_a' => $this->parseHeungATable($lines, $validity),
@@ -4067,6 +4101,528 @@ class RateExtractionService
         }
 
         return $rates;
+    }
+
+    /**
+     * Parse PIL (Pacific International Lines) table format
+     * Routes to region-specific parsers based on region keyword
+     */
+    protected function parsePilTable(array $lines, string $validity): array
+    {
+        // Detect region from content (check for region keywords)
+        $content = implode("\n", $lines);
+
+        if (preg_match('/\bAfrica\b/i', $content)) {
+            return $this->parsePilAfricaTable($lines, $validity);
+        } elseif (preg_match('/\bIntra\s+Asia\b/i', $content)) {
+            return $this->parsePilIntraAsiaTable($lines, $validity);
+        } elseif (preg_match('/\b(Latin|South)\s+America\b/i', $content)) {
+            return $this->parsePilLatinAmericaTable($lines, $validity);
+        } elseif (preg_match('/\bOceania\b/i', $content)) {
+            return $this->parsePilOceaniaTable($lines, $validity);
+        } elseif (preg_match('/\bSouth\s+Asia\b/i', $content)) {
+            return $this->parsePilSouthAsiaTable($lines, $validity);
+        }
+
+        // Fallback
+        return [];
+    }
+
+    /**
+     * Parse PIL Africa region format (handles merged rows with multiple destinations)
+     */
+    protected function parsePilAfricaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $inDataSection = false;
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+            if (count($cells) < 5) continue;
+
+            // Detect if row contains multiple destinations (multiple port codes like NGLOS, GHTEM, etc.)
+            // Strategy: Find all 5-letter uppercase port codes and process each as separate destination
+            $portCodes = [];
+            foreach ($cells as $idx => $cell) {
+                if (preg_match('/^[A-Z]{5}$/', trim($cell))) {
+                    $portCodes[] = ['index' => $idx, 'code' => trim($cell)];
+                }
+            }
+
+            // If multiple port codes found, process each destination separately
+            if (count($portCodes) > 1) {
+                // Process each destination within the merged row
+                foreach ($portCodes as $i => $portInfo) {
+                    $codeIdx = $portInfo['index'];
+
+                    // Port name is in cell before code (idx-1)
+                    $pod = trim($cells[$codeIdx - 1] ?? '');
+                    $code = $portInfo['code'];
+
+                    // Rates are in cells after code: 20' (idx+1), 40' (idx+2)
+                    $rate20Raw = trim($cells[$codeIdx + 1] ?? '');
+                    $rate40Raw = trim($cells[$codeIdx + 2] ?? '');
+
+                    // T/T, T/S, FREE TIME are next cells (idx+3, idx+4, idx+5)
+                    $tt = trim($cells[$codeIdx + 3] ?? '');
+                    $ts = trim($cells[$codeIdx + 4] ?? '');
+                    $freeTime = trim($cells[$codeIdx + 5] ?? '');
+
+                    // Remark is usually the last cell for this destination (idx+6)
+                    $remarkCell = trim($cells[$codeIdx + 6] ?? '');
+
+                    // Skip if port name is empty or looks like header
+                    if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
+
+                    // Parse rates (extract base rate and remark)
+                    $parsed20 = $this->parsePilRate($rate20Raw);
+                    $parsed40 = $this->parsePilRate($rate40Raw);
+
+                    // Build remark from additional charges and remark cell
+                    $remarkParts = [];
+                    if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
+                    if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
+                        $remarkParts[] = $parsed40['remark'];
+                    }
+                    if (!empty($remarkCell)) $remarkParts[] = $remarkCell;
+
+                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                        'T/T' => !empty($tt) ? $tt : 'TBA',
+                        'T/S' => !empty($ts) ? $ts : 'TBA',
+                        'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'REMARK' => implode(', ', array_filter($remarkParts)),
+                    ]);
+                }
+            } elseif (count($portCodes) == 1) {
+                // Single port code found - could be normal row or merged row with header
+                $codeIdx = $portCodes[0]['index'];
+                $code = $portCodes[0]['code'];
+
+                // Port name is in cell before code (idx-1)
+                $pod = trim($cells[$codeIdx - 1] ?? '');
+
+                // Rates are in cells after code
+                $rate20Raw = trim($cells[$codeIdx + 1] ?? '');
+                $rate40Raw = trim($cells[$codeIdx + 2] ?? '');
+                $tt = trim($cells[$codeIdx + 3] ?? '');
+                $ts = trim($cells[$codeIdx + 4] ?? '');
+                $freeTime = trim($cells[$codeIdx + 5] ?? '');
+                $remarkCell = trim($cells[$codeIdx + 6] ?? '');
+
+                // Skip if port name is empty or looks like header
+                if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|^PORTs$|^CODE$)/i', $pod)) continue;
+
+                // Parse rates
+                $parsed20 = $this->parsePilRate($rate20Raw);
+                $parsed40 = $this->parsePilRate($rate40Raw);
+
+                // Build remark
+                $remarkParts = [];
+                if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
+                if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
+                    $remarkParts[] = $parsed40['remark'];
+                }
+                if (!empty($remarkCell)) $remarkParts[] = $remarkCell;
+
+                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                    'T/T' => !empty($tt) ? $tt : 'TBA',
+                    'T/S' => !empty($ts) ? $ts : 'TBA',
+                    'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => implode(', ', array_filter($remarkParts)),
+                ]);
+            } else {
+                // Single destination in row - use original logic
+                $pod = trim($cells[0] ?? '');
+                $code = trim($cells[1] ?? '');
+                $rate20Raw = trim($cells[2] ?? '');
+                $rate40Raw = trim($cells[3] ?? '');
+                $tt = trim($cells[4] ?? '');
+                $ts = trim($cells[5] ?? '');
+                $freeTime = trim($cells[6] ?? '');
+
+                // Skip empty or header-like rows
+                if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
+
+                // Parse rates (extract base rate and remark)
+                $parsed20 = $this->parsePilRate($rate20Raw);
+                $parsed40 = $this->parsePilRate($rate40Raw);
+
+                // Build remark from additional charges
+                $remarkParts = [];
+                if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
+                if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
+                    $remarkParts[] = $parsed40['remark'];
+                }
+
+                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                    'T/T' => !empty($tt) ? $tt : 'TBA',
+                    'T/S' => !empty($ts) ? $ts : 'TBA',
+                    'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                    'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                    'REMARK' => implode(', ', $remarkParts),
+                ]);
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse PIL Intra Asia region format (DUAL POL - creates 2 records per destination)
+     */
+    protected function parsePilIntraAsiaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $inDataSection = false;
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+            if (count($cells) < 7) continue;
+
+            // Skip header rows
+            if (preg_match('/(PORTs|CODE|RATE IN USD)/i', $cells[0] ?? '')) {
+                $inDataSection = true;
+                continue;
+            }
+
+            if (!$inDataSection) continue;
+
+            // Intra Asia format (DUAL POL): PORT | CODE | BKK 20' | BKK 40' | LCH 20' | LCH 40' | T/T | T/S | FREE TIME
+            $pod = trim($cells[0] ?? '');
+            $code = trim($cells[1] ?? '');
+            $bkk20Raw = trim($cells[2] ?? '');
+            $bkk40Raw = trim($cells[3] ?? '');
+            $lch20Raw = trim($cells[4] ?? '');
+            $lch40Raw = trim($cells[5] ?? '');
+            $tt = trim($cells[6] ?? '');
+            $ts = trim($cells[7] ?? '');
+            $freeTime = trim($cells[8] ?? '');
+
+            // Skip empty or header-like rows
+            if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
+
+            // Parse BKK rates
+            $bkk20 = $this->parsePilRate($bkk20Raw);
+            $bkk40 = $this->parsePilRate($bkk40Raw);
+
+            // Parse LCH rates
+            $lch20 = $this->parsePilRate($lch20Raw);
+            $lch40 = $this->parsePilRate($lch40Raw);
+
+            // Build remark
+            $remarkParts = [];
+            if (!empty($bkk20['remark'])) $remarkParts[] = $bkk20['remark'];
+            if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
+                $remarkParts[] = $bkk40['remark'];
+            }
+            $remark = implode(', ', array_unique($remarkParts));
+
+            // Create BKK record
+            $rates[] = $this->createRateEntry('PIL', 'BKK', $pod, $bkk20['rate'], $bkk40['rate'], [
+                'T/T' => !empty($tt) ? $tt : 'TBA',
+                'T/S' => !empty($ts) ? $ts : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+
+            // Create LCH record
+            $rates[] = $this->createRateEntry('PIL', 'LCH', $pod, $lch20['rate'], $lch40['rate'], [
+                'T/T' => !empty($tt) ? $tt : 'TBA',
+                'T/S' => !empty($ts) ? $ts : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse PIL Latin America region format
+     */
+    protected function parsePilLatinAmericaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $inDataSection = false;
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+            if (count($cells) < 5) continue;
+
+            // Skip header rows
+            if (preg_match('/(PORTs|CODE|RATE IN USD)/i', $cells[0] ?? '')) {
+                $inDataSection = true;
+                continue;
+            }
+
+            if (!$inDataSection) continue;
+
+            // Latin America format: PORT | CODE | 20' | 40' | T/T | T/S | FREE TIME | LSR
+            $pod = trim($cells[0] ?? '');
+            $code = trim($cells[1] ?? '');
+            $rate20Raw = trim($cells[2] ?? '');
+            $rate40Raw = trim($cells[3] ?? '');
+            $tt = trim($cells[4] ?? '');
+            $ts = trim($cells[5] ?? '');
+            $freeTime = trim($cells[6] ?? '');
+            $lsr = trim($cells[7] ?? '');
+
+            // Skip empty or header-like rows
+            if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
+
+            // Parse rates
+            $parsed20 = $this->parsePilRate($rate20Raw);
+            $parsed40 = $this->parsePilRate($rate40Raw);
+
+            // Build remark from additional charges + LSR
+            $remarkParts = [];
+            if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
+            if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
+                $remarkParts[] = $parsed40['remark'];
+            }
+            if (!empty($lsr)) {
+                $remarkParts[] = 'LSR: ' . $lsr;
+            }
+
+            $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                'T/T' => !empty($tt) ? $tt : 'TBA',
+                'T/S' => !empty($ts) ? $ts : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => implode(', ', $remarkParts),
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse PIL Oceania region format (side-by-side layout with 2 destinations per row)
+     */
+    protected function parsePilOceaniaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $inDataSection = false;
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+
+            // Skip header rows
+            if (preg_match('/(PORTs|CODE|RATE IN USD)/i', $cells[0] ?? '')) {
+                $inDataSection = true;
+                continue;
+            }
+
+            if (!$inDataSection) continue;
+
+            // Skip size header row (20'GP | 40'GP | 40'HC | ...)
+            if (preg_match('/^(20\'|40\')/i', $cells[0] ?? '')) continue;
+
+            // Oceania has side-by-side layout:
+            // Left destination (cells 0-8) | Right destination (cells 9-17)
+            // Each side: PORT | CODE | 20' | 40' | 40'HQ | T/T | T/S | F/T | REMARK
+
+            if (count($cells) >= 9) {
+                // Process left destination
+                $pod1 = trim($cells[0] ?? '');
+                $code1 = trim($cells[1] ?? '');
+                $rate20Raw1 = trim($cells[2] ?? '');
+                $rate40Raw1 = trim($cells[3] ?? '');
+                $rate40HQ1 = trim($cells[4] ?? '');
+                $tt1 = trim($cells[5] ?? '');
+                $ts1 = trim($cells[6] ?? '');
+                $freeTime1 = trim($cells[7] ?? '');
+                $remark1 = trim($cells[8] ?? '');
+
+                if (!empty($pod1) && !preg_match('/(Validity|Rates quotation|Note|PORTs)/i', $pod1)) {
+                    $parsed20_1 = $this->parsePilRate($rate20Raw1);
+                    $parsed40_1 = $this->parsePilRate($rate40Raw1);
+
+                    $remarkParts1 = [];
+                    if (!empty($remark1)) $remarkParts1[] = $remark1;
+                    if (!empty($parsed20_1['remark'])) $remarkParts1[] = $parsed20_1['remark'];
+                    if (!empty($parsed40_1['remark']) && $parsed40_1['remark'] !== $parsed20_1['remark']) {
+                        $remarkParts1[] = $parsed40_1['remark'];
+                    }
+
+                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod1, $parsed20_1['rate'], $parsed40_1['rate'], [
+                        'T/T' => !empty($tt1) ? $tt1 : 'TBA',
+                        'T/S' => !empty($ts1) ? $ts1 : 'TBA',
+                        'FREE TIME' => !empty($freeTime1) ? $freeTime1 : 'TBA',
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'REMARK' => implode(', ', array_filter($remarkParts1)),
+                    ]);
+                }
+            }
+
+            if (count($cells) >= 17) {
+                // Process right destination (cells 9-16, cell 17 is optional remark)
+                $pod2 = trim($cells[9] ?? '');
+                $code2 = trim($cells[10] ?? '');
+                $rate20Raw2 = trim($cells[11] ?? '');
+                $rate40Raw2 = trim($cells[12] ?? '');
+                $rate40HQ2 = trim($cells[13] ?? '');
+                $tt2 = trim($cells[14] ?? '');
+                $ts2 = trim($cells[15] ?? '');
+                $freeTime2 = trim($cells[16] ?? '');
+                $remark2 = trim($cells[17] ?? '');  // Optional - may not exist in OCR
+
+                if (!empty($pod2) && !preg_match('/(Validity|Rates quotation|Note|PORTs)/i', $pod2)) {
+                    $parsed20_2 = $this->parsePilRate($rate20Raw2);
+                    $parsed40_2 = $this->parsePilRate($rate40Raw2);
+
+                    $remarkParts2 = [];
+                    if (!empty($remark2)) $remarkParts2[] = $remark2;
+                    if (!empty($parsed20_2['remark'])) $remarkParts2[] = $parsed20_2['remark'];
+                    if (!empty($parsed40_2['remark']) && $parsed40_2['remark'] !== $parsed20_2['remark']) {
+                        $remarkParts2[] = $parsed40_2['remark'];
+                    }
+
+                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod2, $parsed20_2['rate'], $parsed40_2['rate'], [
+                        'T/T' => !empty($tt2) ? $tt2 : 'TBA',
+                        'T/S' => !empty($ts2) ? $ts2 : 'TBA',
+                        'FREE TIME' => !empty($freeTime2) ? $freeTime2 : 'TBA',
+                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                        'REMARK' => implode(', ', array_filter($remarkParts2)),
+                    ]);
+                }
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse PIL South Asia region format (DUAL POL - creates 2 records per destination)
+     */
+    protected function parsePilSouthAsiaTable(array $lines, string $validity): array
+    {
+        $rates = [];
+        $inDataSection = false;
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
+
+            $cells = explode(' | ', $matches[1]);
+            if (count($cells) < 7) continue;
+
+            // Skip header rows
+            if (preg_match('/(PORTs|CODE|RATE IN USD)/i', $cells[0] ?? '')) {
+                $inDataSection = true;
+                continue;
+            }
+
+            if (!$inDataSection) continue;
+
+            // South Asia format (DUAL POL): PORT | CODE | BKK 20' | BKK 40' | LCH 20' | LCH 40' | T/T | T/S | FREE TIME
+            $pod = trim($cells[0] ?? '');
+            $code = trim($cells[1] ?? '');
+            $bkk20Raw = trim($cells[2] ?? '');
+            $bkk40Raw = trim($cells[3] ?? '');
+            $lch20Raw = trim($cells[4] ?? '');
+            $lch40Raw = trim($cells[5] ?? '');
+            $tt = trim($cells[6] ?? '');
+            $ts = trim($cells[7] ?? '');
+            $freeTime = trim($cells[8] ?? '');
+
+            // Skip empty or header-like rows
+            if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
+
+            // Parse BKK rates
+            $bkk20 = $this->parsePilRate($bkk20Raw);
+            $bkk40 = $this->parsePilRate($bkk40Raw);
+
+            // Parse LCH rates
+            $lch20 = $this->parsePilRate($lch20Raw);
+            $lch40 = $this->parsePilRate($lch40Raw);
+
+            // Build remark
+            $remarkParts = [];
+            if (!empty($bkk20['remark'])) $remarkParts[] = $bkk20['remark'];
+            if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
+                $remarkParts[] = $bkk40['remark'];
+            }
+            $remark = implode(', ', array_unique($remarkParts));
+
+            // Create BKK record
+            $rates[] = $this->createRateEntry('PIL', 'BKK', $pod, $bkk20['rate'], $bkk40['rate'], [
+                'T/T' => !empty($tt) ? $tt : 'TBA',
+                'T/S' => !empty($ts) ? $ts : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+
+            // Create LCH record
+            $rates[] = $this->createRateEntry('PIL', 'LCH', $pod, $lch20['rate'], $lch40['rate'], [
+                'T/T' => !empty($tt) ? $tt : 'TBA',
+                'T/S' => !empty($ts) ? $ts : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'VALIDITY' => $validity ?: strtoupper(date('M Y')),
+                'REMARK' => $remark,
+            ]);
+        }
+
+        return $rates;
+    }
+
+    /**
+     * Parse PIL rate format and extract base rate + additional charges for remark
+     * Example: "2,600+HEA" -> rate: 2600, remark: "+HEA"
+     */
+    protected function parsePilRate(string $rateString): array
+    {
+        $rateString = trim($rateString);
+
+        // Handle n/a and empty
+        if (empty($rateString) || strtolower($rateString) === 'n/a') {
+            return ['rate' => '', 'remark' => ''];
+        }
+
+        // Extract base numeric rate (remove commas)
+        preg_match('/([\d,]+)/', $rateString, $matches);
+        $baseRate = isset($matches[1]) ? str_replace(',', '', $matches[1]) : '';
+
+        // Extract additional charges for REMARK
+        $remarkParts = [];
+
+        if (preg_match('/\+HEA/', $rateString)) {
+            $remarkParts[] = '+HEA';
+        }
+
+        if (preg_match('/\+AMS/', $rateString)) {
+            $remarkParts[] = '+AMS';
+        }
+
+        if (preg_match('/\+\s*ISD\s*(\d+)/', $rateString, $m)) {
+            $remarkParts[] = '+ISD USD' . $m[1];
+        }
+
+        if (preg_match('/\((.*?included.*?)\)/i', $rateString, $m)) {
+            $remarkParts[] = $m[1];
+        }
+
+        // Extract LSR notation
+        if (preg_match('/LSR\s*&\s*ISD\s*included/i', $rateString)) {
+            $remarkParts[] = 'LSR & ISD included';
+        }
+
+        return [
+            'rate' => $baseRate,
+            'remark' => implode(', ', $remarkParts)
+        ];
     }
 
     /**

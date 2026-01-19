@@ -746,4 +746,15 @@ class AzureOcrService
 
         return '';
     }
+
+    /**
+     * Extract full text content from Azure OCR result
+     *
+     * @param array $azureResult
+     * @return string
+     */
+    public function extractFullTextFromResult(array $azureResult): string
+    {
+        return $azureResult['analyzeResult']['content'] ?? '';
+    }
 }
