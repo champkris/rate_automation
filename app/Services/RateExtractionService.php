@@ -4479,7 +4479,8 @@ class RateExtractionService
             $remarkParts = [];
 
             // Rule 1: Add LSR to remark (always, whether Include or numeric value)
-            if (!empty($lsr)) {
+            // Filter out placeholder values like "-", "N/A", "TBA", "—", etc.
+            if (!empty($lsr) && !preg_match('/^(-|—|N\/?A|TBA|n\/a)$/i', $lsr)) {
                 if (strtolower($lsr) === 'include') {
                     $remarkParts[] = 'LSR Include';
                 } else {

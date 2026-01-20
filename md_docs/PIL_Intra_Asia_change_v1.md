@@ -253,7 +253,8 @@ if (empty($remark)) {
 - **Implementation**:
   - If LSR = "Include" → Add "LSR Include"
   - If LSR = numeric (e.g., "78/156") → Add "LSR: 78/156"
-- **Always runs**: Even if there are other remarks
+  - **Placeholder filtering**: Ignores "-", "—", "N/A", "TBA" (treated as empty)
+- **Always runs**: Even if there are other remarks (unless LSR is placeholder/empty)
 
 **Rule 2 - Rate Parsing Remarks**:
 - **Purpose**: Capture charges extracted from rate values (e.g., "+HEA", "+EID")
