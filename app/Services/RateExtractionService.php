@@ -4463,17 +4463,16 @@ class RateExtractionService
                 continue;
             }
 
-            // Parse BKK rates
-            $bkk20 = $this->parsePilRate($bkk20Raw);
-            $bkk40 = $this->parsePilRate($bkk40Raw);
-
-            // Parse LCH rates
-            $lch20 = $this->parsePilRate($lch20Raw);
-            $lch40 = $this->parsePilRate($lch40Raw);
+            // INTRA ASIA: Use AFRICA STYLE - Keep FULL rate text (like "2600+HEA")
+            // Just remove commas from numeric part for storage
+            $bkk20 = str_replace(',', '', $bkk20Raw);
+            $bkk40 = str_replace(',', '', $bkk40Raw);
+            $lch20 = str_replace(',', '', $lch20Raw);
+            $lch40 = str_replace(',', '', $lch40Raw);
 
             // Build remark per Intra Asia rules:
             // 1. Always include LSR value (whether "Include" or numeric) as "LSR Include" or "LSR: {value}"
-            // 2. Add any remark from rates (from parsePilRate)
+            // 2. [REMOVED - Changed to Africa style] Rate parsing remarks
             // 3. Add PDF remark field if present
             // 4. If final remark is empty, add default message
             $remarkParts = [];
@@ -4488,11 +4487,7 @@ class RateExtractionService
                 }
             }
 
-            // Rule 2: Add remarks from rate parsing (additional charges like EID, HEA, etc.)
-            if (!empty($bkk20['remark'])) $remarkParts[] = $bkk20['remark'];
-            if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
-                $remarkParts[] = $bkk40['remark'];
-            }
+            // Rule 2: [REMOVED] Rate parsing remarks - Now using Africa style (keep full rate text in rate column)
 
             // Rule 3: Add PDF remark column content (e.g., "Subject to EID...")
             if (!empty($pdfRemark)) {
@@ -4510,7 +4505,7 @@ class RateExtractionService
             }
 
             // Create BKK record
-            $rates[] = $this->createRateEntry('PIL', 'BKK', $pod, $bkk20['rate'], $bkk40['rate'], [
+            $rates[] = $this->createRateEntry('PIL', 'BKK', $pod, $bkk20, $bkk40, [
                 'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',  // Correct: Free time → FREE TIME
                 'T/T' => !empty($tt) ? $tt : 'TBA',                    // Correct: T/T (DAY) → T/T
                 'T/S' => !empty($ts) ? $ts : 'TBA',                    // Correct: T/S → T/S
@@ -4519,7 +4514,7 @@ class RateExtractionService
             ]);
 
             // Create LCH record
-            $rates[] = $this->createRateEntry('PIL', 'LCH', $pod, $lch20['rate'], $lch40['rate'], [
+            $rates[] = $this->createRateEntry('PIL', 'LCH', $pod, $lch20, $lch40, [
                 'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',  // Correct: Free time → FREE TIME
                 'T/T' => !empty($tt) ? $tt : 'TBA',                    // Correct: T/T (DAY) → T/T
                 'T/S' => !empty($ts) ? $ts : 'TBA',                    // Correct: T/S → T/S

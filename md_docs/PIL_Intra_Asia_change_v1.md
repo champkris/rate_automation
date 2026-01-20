@@ -208,15 +208,23 @@ if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
 $remark = implode(', ', array_unique($remarkParts));
 
 // AFTER:
+// INTRA ASIA: Use AFRICA STYLE - Keep FULL rate text (like "2600+HEA")
+// Just remove commas from numeric part for storage
+$bkk20 = str_replace(',', '', $bkk20Raw);
+$bkk40 = str_replace(',', '', $bkk40Raw);
+$lch20 = str_replace(',', '', $lch20Raw);
+$lch40 = str_replace(',', '', $lch40Raw);
+
 // Build remark per Intra Asia rules:
 // 1. Always include LSR value (whether "Include" or numeric) as "LSR Include" or "LSR: {value}"
-// 2. Add any remark from rates (from parsePilRate)
+// 2. [REMOVED - Changed to Africa style] Rate parsing remarks
 // 3. Add PDF remark field if present
 // 4. If final remark is empty, add default message
 $remarkParts = [];
 
 // Rule 1: Add LSR to remark (always, whether Include or numeric value)
-if (!empty($lsr)) {
+// Filter out placeholder values like "-", "N/A", "TBA", "—", etc.
+if (!empty($lsr) && !preg_match('/^(-|—|N\/?A|TBA|n\/a)$/i', $lsr)) {
     if (strtolower($lsr) === 'include') {
         $remarkParts[] = 'LSR Include';
     } else {
@@ -224,11 +232,7 @@ if (!empty($lsr)) {
     }
 }
 
-// Rule 2: Add remarks from rate parsing (additional charges like EID, HEA, etc.)
-if (!empty($bkk20['remark'])) $remarkParts[] = $bkk20['remark'];
-if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
-    $remarkParts[] = $bkk40['remark'];
-}
+// Rule 2: [REMOVED] Rate parsing remarks - Now using Africa style (keep full rate text in rate column)
 
 // Rule 3: Add PDF remark column content (e.g., "Subject to EID...")
 if (!empty($pdfRemark)) {
@@ -256,10 +260,17 @@ if (empty($remark)) {
   - **Placeholder filtering**: Ignores "-", "—", "N/A", "TBA" (treated as empty)
 - **Always runs**: Even if there are other remarks (unless LSR is placeholder/empty)
 
-**Rule 2 - Rate Parsing Remarks**:
-- **Purpose**: Capture charges extracted from rate values (e.g., "+HEA", "+EID")
-- **Implementation**: parsePilRate() extracts these and returns them in ['remark']
-- **Example**: "2600+HEA" → rate='2600', remark='HEA included'
+**Rule 2 - Rate Column Content (Africa Style)**:
+- **Changed from**: Parsing rates to extract numeric part only, adding charges to REMARK
+- **Changed to**: Keep FULL rate text in rate column (matches Africa continent implementation)
+- **Implementation**: `str_replace(',', '', $rateRaw)` - Only removes commas, keeps everything else
+- **Examples**:
+  - Input: `"2600"` → Output: `"2600"` (no change for pure numeric)
+  - Input: `"2,600"` → Output: `"2600"` (removes comma)
+  - Input: `"2600+HEA"` → Output: `"2600+HEA"` (keeps full text)
+  - Input: `"2,600+HEA"` → Output: `"2600+HEA"` (removes comma, keeps charges)
+- **Why changed**: Preserves complete rate information in rate column, user can see full context
+- **REMARK impact**: Rate-based charges ("+HEA", "+EID") NO LONGER appear in REMARK field
 
 **Rule 3 - PDF Remark Column**:
 - **Purpose**: Include explicit remarks from PDF's Remark column
