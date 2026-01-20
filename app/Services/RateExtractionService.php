@@ -4214,22 +4214,32 @@ class RateExtractionService
                     $rate40 = str_replace(',', '', $rate40Raw);
 
                     // AFRICA: Remark comes ONLY from remark cell (not from rate text)
-                    // Special check: If remarkCell looks like a port name (e.g., "Cotonou", "Tema"), treat it as empty
+                    // Special check: If remarkCell is EXACTLY a port name/code (e.g., "Cotonou", "NGLAG"), treat it as empty
                     // This happens in merged rows where the next port name appears in the remark position
                     $knownAfricanPorts = ['Apapa', 'Lagos', 'Onne', 'Tema', 'Lome', 'Cotonou', 'Abidjan', 'Douala',
                                           'Mombasa', 'Dar Es Salaam', 'Zanzibar', 'Durban', 'Capetown',
                                           'Maputo', 'Beira', 'Nacala', 'Toamasina', 'Tamatave', 'Reunion', 'Port Louis'];
 
-                    $isPortName = false;
-                    foreach ($knownAfricanPorts as $portName) {
-                        if (stripos($remarkCell, $portName) !== false) {
-                            $isPortName = true;
-                            break;
+                    $isJustPortName = false;
+                    $trimmedRemark = trim($remarkCell);
+
+                    // Check if it's exactly a port name (case-insensitive exact match)
+                    if (!empty($trimmedRemark)) {
+                        foreach ($knownAfricanPorts as $portName) {
+                            if (strcasecmp($trimmedRemark, $portName) === 0) {
+                                $isJustPortName = true;
+                                break;
+                            }
+                        }
+
+                        // Or check if it looks like a port code (3-5 uppercase letters only)
+                        if (!$isJustPortName && preg_match('/^[A-Z]{3,5}$/', $trimmedRemark)) {
+                            $isJustPortName = true;
                         }
                     }
 
-                    // If remarkCell is empty or is a port name, add default
-                    $finalRemark = (!empty($remarkCell) && !$isPortName) ? $remarkCell : 'Rates are subject to local charges at both ends.';
+                    // If remarkCell is empty/blank or is just a port name/code, use default
+                    $finalRemark = (!empty($trimmedRemark) && !$isJustPortName) ? $remarkCell : 'Rates are subject to local charges at both ends.';
 
                     $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
                         'T/T' => !empty($tt) ? $tt : 'TBA',
