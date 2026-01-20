@@ -4319,44 +4319,60 @@ class RateExtractionService
      */
     protected function sortAfricaPortsByRegion(array $rates): array
     {
-        // Define port order by region
-        $portOrder = [
-            // West Africa (7 ports)
-            'Apapa, Lagos' => 1,
-            'Onne' => 2,
-            'Tema' => 3,
-            'Lome' => 4,
-            'Cotonou' => 5,
-            'Abidjan' => 6,
-            'Douala' => 7,
-
-            // East Africa (3 ports)
-            'Mombasa' => 8,
-            'Dar Es Salaam' => 9,
-            'Zanzibar' => 10,
-
-            // South Africa (2 ports)
-            'Durban' => 11,
-            'Capetown' => 12,
-
-            // Mozambique (3 ports)
-            'Maputo' => 13,
-            'Beira' => 14,
-            'Nacala' => 15,
-
-            // Indian Ocean Islands (3 ports)
-            'Toamasina (Tamatave)' => 16,
-            'Reunion (Pointe Des Galets)' => 17,
-            'Port Louis' => 18,
+        // Define regions with ports grouped by geography (for better maintainability)
+        $regions = [
+            'West Africa' => ['Apapa, Lagos', 'Onne', 'Tema', 'Lome', 'Cotonou', 'Abidjan', 'Douala'],
+            'East Africa' => ['Mombasa', 'Dar Es Salaam', 'Zanzibar'],
+            'South Africa' => ['Durban', 'Capetown'],
+            'Mozambique' => ['Maputo', 'Beira', 'Nacala'],
+            'Indian Ocean' => ['Toamasina (Tamatave)', 'Reunion (Pointe Des Galets)', 'Port Louis'],
         ];
+
+        // Auto-generate port order from regions
+        $portOrder = [];
+        $position = 1;
+        foreach ($regions as $regionName => $ports) {
+            foreach ($ports as $port) {
+                $portOrder[$port] = $position++;
+            }
+        }
+
+        // Detect unknown ports (not in the predefined list)
+        $unknownPorts = [];
+        foreach ($rates as $rate) {
+            $pod = $rate['POD'] ?? '';
+            if (!empty($pod) && !isset($portOrder[$pod])) {
+                if (!in_array($pod, $unknownPorts)) {
+                    $unknownPorts[] = $pod;
+                }
+            }
+        }
+
+        // Log unknown ports for manual review
+        if (!empty($unknownPorts)) {
+            \Log::warning('PIL Africa: Unknown ports detected during extraction', [
+                'unknown_ports' => $unknownPorts,
+                'total_unknown' => count($unknownPorts),
+                'action_required' => 'These ports were placed at the end of the list. Please update $regions array in sortAfricaPortsByRegion() method if they should be in a specific geographical position.',
+                'file' => 'app/Services/RateExtractionService.php',
+                'method' => 'sortAfricaPortsByRegion',
+                'line_range' => '4320-4365',
+            ]);
+
+            // Assign unknown ports to positions after all known ports
+            $unknownPosition = 999;
+            foreach ($unknownPorts as $port) {
+                $portOrder[$port] = $unknownPosition++;
+            }
+        }
 
         // Sort rates based on port order
         usort($rates, function($a, $b) use ($portOrder) {
             $podA = $a['POD'] ?? '';
             $podB = $b['POD'] ?? '';
 
-            $orderA = $portOrder[$podA] ?? 999;
-            $orderB = $portOrder[$podB] ?? 999;
+            $orderA = $portOrder[$podA] ?? 9999; // Fallback for edge cases
+            $orderB = $portOrder[$podB] ?? 9999;
 
             return $orderA - $orderB;
         });
