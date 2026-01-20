@@ -4411,6 +4411,10 @@ class RateExtractionService
 
     /**
      * Parse PIL Intra Asia region format (DUAL POL - creates 2 records per destination)
+     *
+     * Column Order (from Azure OCR):
+     * 0: PORT | 1: CODE | 2: BKK 20' | 3: BKK 40' | 4: LCH 20' | 5: LCH 40' |
+     * 6: LSR | 7: Free time | 8: T/T (DAY) | 9: T/S | 10: Remark
      */
     protected function parsePilIntraAsiaTable(array $lines, string $validity): array
     {
@@ -4431,19 +4435,33 @@ class RateExtractionService
 
             if (!$inDataSection) continue;
 
-            // Intra Asia format (DUAL POL): PORT | CODE | BKK 20' | BKK 40' | LCH 20' | LCH 40' | T/T | T/S | FREE TIME
+            // CORRECT Intra Asia column mapping:
+            // PORT | CODE | BKK 20' | BKK 40' | LCH 20' | LCH 40' | LSR | Free time | T/T (DAY) | T/S | Remark
             $pod = trim($cells[0] ?? '');
             $code = trim($cells[1] ?? '');
             $bkk20Raw = trim($cells[2] ?? '');
             $bkk40Raw = trim($cells[3] ?? '');
             $lch20Raw = trim($cells[4] ?? '');
             $lch40Raw = trim($cells[5] ?? '');
-            $tt = trim($cells[6] ?? '');
-            $ts = trim($cells[7] ?? '');
-            $freeTime = trim($cells[8] ?? '');
+            $lsr = trim($cells[6] ?? '');           // LSR field (Include or numeric)
+            $freeTime = trim($cells[7] ?? '');      // Free time (from PDF column "Free time")
+            $tt = trim($cells[8] ?? '');            // T/T (DAY) (transit time in days)
+            $ts = trim($cells[9] ?? '');            // T/S (transshipment port)
+            $pdfRemark = trim($cells[10] ?? '');    // Remark from PDF (e.g., "Subject to EID...")
 
-            // Skip empty or header-like rows
-            if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
+            // Skip empty or header-like rows (including region headers)
+            // NOTE: "Singapore" is both a region header AND a valid port name, so we DON'T filter it here
+            // The data row has CODE=SGSIN which distinguishes it from the region header (which has empty CODE)
+            if (empty($pod) ||
+                preg_match('/(Validity|Rates quotation|Note|^Malaysia$|^Brunei$|^Cambodia$|^Philippines$|^Indonesia$|^Vietnam$|^Myanmar$)/i', $pod)) {
+                continue;
+            }
+
+            // Additional filter: Skip region header rows (they have empty CODE field)
+            // This catches "Singapore", "Malaysia", etc. when they appear as section headers
+            if (empty($code)) {
+                continue;
+            }
 
             // Parse BKK rates
             $bkk20 = $this->parsePilRate($bkk20Raw);
@@ -4453,28 +4471,57 @@ class RateExtractionService
             $lch20 = $this->parsePilRate($lch20Raw);
             $lch40 = $this->parsePilRate($lch40Raw);
 
-            // Build remark
+            // Build remark per Intra Asia rules:
+            // 1. Always include LSR value (whether "Include" or numeric) as "LSR Include" or "LSR: {value}"
+            // 2. Add any remark from rates (from parsePilRate)
+            // 3. Add PDF remark field if present
+            // 4. If final remark is empty, add default message
             $remarkParts = [];
+
+            // Rule 1: Add LSR to remark (always, whether Include or numeric value)
+            if (!empty($lsr)) {
+                if (strtolower($lsr) === 'include') {
+                    $remarkParts[] = 'LSR Include';
+                } else {
+                    $remarkParts[] = 'LSR: ' . $lsr;
+                }
+            }
+
+            // Rule 2: Add remarks from rate parsing (additional charges like EID, HEA, etc.)
             if (!empty($bkk20['remark'])) $remarkParts[] = $bkk20['remark'];
             if (!empty($bkk40['remark']) && $bkk40['remark'] !== $bkk20['remark']) {
                 $remarkParts[] = $bkk40['remark'];
             }
+
+            // Rule 3: Add PDF remark column content (e.g., "Subject to EID...")
+            if (!empty($pdfRemark)) {
+                // Normalize spacing around asterisks: "** text **" → "**text**"
+                $pdfRemark = preg_replace('/\*\*\s+/', '**', $pdfRemark);
+                $pdfRemark = preg_replace('/\s+\*\*/', '**', $pdfRemark);
+                $remarkParts[] = $pdfRemark;
+            }
+
             $remark = implode(', ', array_unique($remarkParts));
+
+            // Rule 4: Default remark if empty
+            if (empty($remark)) {
+                $remark = 'Rates are subject to local charges at both ends.';
+            }
 
             // Create BKK record
             $rates[] = $this->createRateEntry('PIL', 'BKK', $pod, $bkk20['rate'], $bkk40['rate'], [
-                'T/T' => !empty($tt) ? $tt : 'TBA',
-                'T/S' => !empty($ts) ? $ts : 'TBA',
-                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',  // Correct: Free time → FREE TIME
+                'T/T' => !empty($tt) ? $tt : 'TBA',                    // Correct: T/T (DAY) → T/T
+                'T/S' => !empty($ts) ? $ts : 'TBA',                    // Correct: T/S → T/S
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                 'REMARK' => $remark,
             ]);
 
             // Create LCH record
             $rates[] = $this->createRateEntry('PIL', 'LCH', $pod, $lch20['rate'], $lch40['rate'], [
-                'T/T' => !empty($tt) ? $tt : 'TBA',
-                'T/S' => !empty($ts) ? $ts : 'TBA',
-                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
+                'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',  // Correct: Free time → FREE TIME
+                'T/T' => !empty($tt) ? $tt : 'TBA',                    // Correct: T/T (DAY) → T/T
+                'T/S' => !empty($ts) ? $ts : 'TBA',                    // Correct: T/S → T/S
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                 'REMARK' => $remark,
             ]);
