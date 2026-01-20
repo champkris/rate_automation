@@ -91,7 +91,8 @@ class RateExtractionController extends Controller
             // Use pattern name if specific (not auto), otherwise use carrier from rates
             $carrierName = $this->getCarrierNameFromPattern($pattern, $originalName, $rates);
             $validityPeriod = $this->getValidityPeriod($rates);
-            $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod);
+            $region = $this->getRegionFromRates($rates);
+            $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod, $region);
 
             // Store session data for download
             session([
@@ -243,6 +244,7 @@ class RateExtractionController extends Controller
         $patternNames = [
             'rcl' => 'RCL',
             'kmtc' => 'KMTC',
+            'pil' => 'PIL',
             'sinokor' => 'SINOKOR',
             'sinokor_skr' => 'SINOKOR_SKR',
             'heung_a' => 'HEUNG_A',
@@ -305,10 +307,24 @@ class RateExtractionController extends Controller
     }
 
     /**
-     * Generate download filename from carrier and validity
-     * Example: "SINOKOR_1-30_NOV_2025.xlsx"
+     * Get region from rates (for PIL carriers with region metadata)
      */
-    protected function generateDownloadFilename(string $carrier, string $validity): string
+    protected function getRegionFromRates(array $rates): ?string
+    {
+        // Check if any rate has region metadata
+        foreach ($rates as $rate) {
+            if (isset($rate['_region'])) {
+                return $rate['_region'];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Generate download filename from carrier, validity, and region
+     * Example: "PIL_Africa_1-30_NOV_2025.xlsx" or "SINOKOR_1-30_NOV_2025.xlsx"
+     */
+    protected function generateDownloadFilename(string $carrier, string $validity, ?string $region = null): string
     {
         // Clean carrier name (remove special characters, keep alphanumeric and spaces)
         $cleanCarrier = preg_replace('/[^a-zA-Z0-9\s]/', '', $carrier);
@@ -321,6 +337,12 @@ class RateExtractionController extends Controller
 
         if (empty($cleanCarrier)) {
             $cleanCarrier = 'RATES';
+        }
+
+        // If region is provided (for PIL), include it in filename
+        // Format: PIL_Africa_date_month or PIL_Intra_Asia_date_month
+        if (!empty($region)) {
+            return strtoupper($cleanCarrier) . '_' . $region . '_' . strtoupper($cleanValidity) . '.xlsx';
         }
 
         return strtoupper($cleanCarrier) . '_' . strtoupper($cleanValidity) . '.xlsx';

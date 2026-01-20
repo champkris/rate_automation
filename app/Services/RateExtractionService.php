@@ -4319,6 +4319,11 @@ class RateExtractionService
         // Expected order: West Africa → East Africa → South Africa → Mozambique → Indian Ocean
         $sortedRates = $this->sortAfricaPortsByRegion($rates);
 
+        // Add region metadata for filename generation
+        foreach ($sortedRates as &$rate) {
+            $rate['_region'] = 'Africa';
+        }
+
         return $sortedRates;
     }
 
@@ -4462,6 +4467,11 @@ class RateExtractionService
             ]);
         }
 
+        // Add region metadata for filename generation
+        foreach ($rates as &$rate) {
+            $rate['_region'] = 'Intra_Asia';
+        }
+
         return $rates;
     }
 
@@ -4521,6 +4531,11 @@ class RateExtractionService
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                 'REMARK' => implode(', ', $remarkParts),
             ]);
+        }
+
+        // Add region metadata for filename generation
+        foreach ($rates as &$rate) {
+            $rate['_region'] = 'Latin_America';
         }
 
         return $rates;
@@ -4621,6 +4636,11 @@ class RateExtractionService
             }
         }
 
+        // Add region metadata for filename generation
+        foreach ($rates as &$rate) {
+            $rate['_region'] = 'Oceania';
+        }
+
         return $rates;
     }
 
@@ -4693,6 +4713,11 @@ class RateExtractionService
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                 'REMARK' => $remark,
             ]);
+        }
+
+        // Add region metadata for filename generation
+        foreach ($rates as &$rate) {
+            $rate['_region'] = 'South_Asia';
         }
 
         return $rates;
