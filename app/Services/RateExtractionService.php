@@ -4193,14 +4193,15 @@ class RateExtractionService
                     if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
 
                     // AFRICA SPECIAL CASE: For merged rows, T/S and FREE TIME might be combined in one cell
-                    // Example: "SIN 10 days" should be split into T/S="SIN" and FREE TIME="10 days"
+                    // Example: "SIN 10 days" or "Singapore 5 dem/ 3 det" should be split
                     $ts = $tsRaw;
                     $freeTime = $freeTimeRaw;
 
-                    // Check if T/S contains both port code and time (e.g., "SIN 10 days")
-                    if (preg_match('/^([A-Z\/]+)\s+(.+)$/', $tsRaw, $matches)) {
-                        $ts = $matches[1];  // "SIN" or "SIN/LFW"
-                        $freeTime = $matches[2];  // "10 days" or "14 days"
+                    // Split at first number: Everything before first digit = T/S, everything from first digit = FREE TIME
+                    // This handles: "SIN 10 days", "Singapore 14 days", "SIN/MUN 5 dem/ 3 det", etc.
+                    if (preg_match('/^(.+?)\s+(\d.*)$/', $tsRaw, $matches)) {
+                        $ts = trim($matches[1]);  // Port code/name (e.g., "SIN", "Singapore", "SIN/MUN")
+                        $freeTime = trim($matches[2]);  // Time text starting with digit (e.g., "10 days", "5 dem/ 3 det")
                         // In this case, what we thought was FREE TIME is actually the REMARK
                         if (!empty($freeTimeRaw)) {
                             $remarkCell = $freeTimeRaw;
