@@ -4190,7 +4190,12 @@ class RateExtractionService
                     $remarkCell = trim($cells[$codeIdx + 6] ?? '');
 
                     // Skip if port name is empty or looks like header
-                    if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
+                    // Enhanced pattern to catch: column headers (Remark, CODE, PORTs), section headers (Trade, West Africa),
+                    // carrier/POL appearing as POD (PIL, BKK/LCH), and rate column headers
+                    if (empty($pod) ||
+                        preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$|^Remark$|^PIL$|BKK\/LCH|Trade\s*:\s*Africa|Ex\s+BKK|West Africa|East Africa|South Africa|Mozambique|Indian Ocean)/i', $pod) ||
+                        preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate20Raw) ||
+                        preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate40Raw)) continue;
 
                     // AFRICA SPECIAL CASE: For merged rows, T/S and FREE TIME might be combined in one cell
                     // Example: "SIN 10 days" or "Singapore 5 dem/ 3 det" should be split
@@ -4267,7 +4272,11 @@ class RateExtractionService
                 $remarkCell = trim($cells[$codeIdx + 6] ?? '');
 
                 // Skip if port name is empty or looks like header
-                if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|^PORTs$|^CODE$)/i', $pod)) continue;
+                // Enhanced pattern to catch all header variations
+                if (empty($pod) ||
+                    preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$|^Remark$|^PIL$|BKK\/LCH|Trade\s*:\s*Africa|Ex\s+BKK|West Africa|East Africa|South Africa|Mozambique|Indian Ocean)/i', $pod) ||
+                    preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate20Raw) ||
+                    preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate40Raw)) continue;
 
                 // AFRICA: Use raw rates (keep full text)
                 $rate20 = str_replace(',', '', $rate20Raw);
@@ -4296,7 +4305,11 @@ class RateExtractionService
                 $remarkCell = trim($cells[7] ?? '');
 
                 // Skip empty or header-like rows
-                if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
+                // Enhanced pattern to catch all header variations
+                if (empty($pod) ||
+                    preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$|^Remark$|^PIL$|BKK\/LCH|Trade\s*:\s*Africa|Ex\s+BKK|West Africa|East Africa|South Africa|Mozambique|Indian Ocean)/i', $pod) ||
+                    preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate20Raw) ||
+                    preg_match('/(^CODE$|RATE IN USD|20\'GP|40\'HC)/i', $rate40Raw)) continue;
 
                 // AFRICA: Use raw rates (keep full text)
                 $rate20 = str_replace(',', '', $rate20Raw);
