@@ -4109,18 +4109,33 @@ class RateExtractionService
      */
     protected function parsePilTable(array $lines, string $validity): array
     {
-        // Detect region from content (check for region keywords)
+        // Detect region from content (check for region keywords AND port names)
         $content = implode("\n", $lines);
 
-        if (preg_match('/\bAfrica\b/i', $content)) {
+        // Africa: Check for keyword OR specific African ports
+        if (preg_match('/\bAfrica\b/i', $content) ||
+            preg_match('/\b(Mombasa|Dar\s+Es\s+Salaam|Zanzibar|Apapa|Lagos|Tema|Lome|Cotonou|Abidjan|Douala|Durban|Capetown|Maputo|Beira|Nacala|Toamasina|Tamatave|Reunion|Port\s+Louis)\b/i', $content)) {
             return $this->parsePilAfricaTable($lines, $validity);
-        } elseif (preg_match('/\bIntra\s+Asia\b/i', $content)) {
+        }
+
+        // Intra Asia
+        elseif (preg_match('/\bIntra\s+Asia\b/i', $content)) {
             return $this->parsePilIntraAsiaTable($lines, $validity);
-        } elseif (preg_match('/\b(Latin|South)\s+America\b/i', $content)) {
+        }
+
+        // Latin America
+        elseif (preg_match('/\b(Latin|South)\s+America\b/i', $content)) {
             return $this->parsePilLatinAmericaTable($lines, $validity);
-        } elseif (preg_match('/\bOceania\b/i', $content)) {
+        }
+
+        // Oceania
+        elseif (preg_match('/\bOceania\b/i', $content)) {
             return $this->parsePilOceaniaTable($lines, $validity);
-        } elseif (preg_match('/\bSouth\s+Asia\b/i', $content)) {
+        }
+
+        // South Asia: Check for keyword OR specific South Asian ports
+        elseif (preg_match('/\bSouth\s+Asia\b/i', $content) ||
+                preg_match('/\b(Chattogram|Chittagong|Mongla|Dhaka|Chennai|Madras|Gangavaram|Calcutta|Kolkata|Nhava\s+Sheva|Mumbai|Mundra)\b/i', $content)) {
             return $this->parsePilSouthAsiaTable($lines, $validity);
         }
 
@@ -4162,13 +4177,14 @@ class RateExtractionService
                     $code = $portInfo['code'];
 
                     // Rates are in cells after code: 20' (idx+1), 40' (idx+2)
+                    // AFRICA REQUIREMENT: Keep FULL rate text (don't parse it)
                     $rate20Raw = trim($cells[$codeIdx + 1] ?? '');
                     $rate40Raw = trim($cells[$codeIdx + 2] ?? '');
 
                     // T/T, T/S, FREE TIME are next cells (idx+3, idx+4, idx+5)
                     $tt = trim($cells[$codeIdx + 3] ?? '');
-                    $ts = trim($cells[$codeIdx + 4] ?? '');
-                    $freeTime = trim($cells[$codeIdx + 5] ?? '');
+                    $tsRaw = trim($cells[$codeIdx + 4] ?? '');
+                    $freeTimeRaw = trim($cells[$codeIdx + 5] ?? '');
 
                     // Remark is usually the last cell for this destination (idx+6)
                     $remarkCell = trim($cells[$codeIdx + 6] ?? '');
@@ -4176,24 +4192,50 @@ class RateExtractionService
                     // Skip if port name is empty or looks like header
                     if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
 
-                    // Parse rates (extract base rate and remark)
-                    $parsed20 = $this->parsePilRate($rate20Raw);
-                    $parsed40 = $this->parsePilRate($rate40Raw);
+                    // AFRICA SPECIAL CASE: For merged rows, T/S and FREE TIME might be combined in one cell
+                    // Example: "SIN 10 days" should be split into T/S="SIN" and FREE TIME="10 days"
+                    $ts = $tsRaw;
+                    $freeTime = $freeTimeRaw;
 
-                    // Build remark from additional charges and remark cell
-                    $remarkParts = [];
-                    if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
-                    if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
-                        $remarkParts[] = $parsed40['remark'];
+                    // Check if T/S contains both port code and time (e.g., "SIN 10 days")
+                    if (preg_match('/^([A-Z\/]+)\s+(.+)$/', $tsRaw, $matches)) {
+                        $ts = $matches[1];  // "SIN" or "SIN/LFW"
+                        $freeTime = $matches[2];  // "10 days" or "14 days"
+                        // In this case, what we thought was FREE TIME is actually the REMARK
+                        if (!empty($freeTimeRaw)) {
+                            $remarkCell = $freeTimeRaw;
+                        }
                     }
-                    if (!empty($remarkCell)) $remarkParts[] = $remarkCell;
 
-                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                    // AFRICA: Use raw rates (keep full text like "2,600+HEA ( LSR & ISD included )")
+                    // Remove commas from numeric part for storage
+                    $rate20 = str_replace(',', '', $rate20Raw);
+                    $rate40 = str_replace(',', '', $rate40Raw);
+
+                    // AFRICA: Remark comes ONLY from remark cell (not from rate text)
+                    // Special check: If remarkCell looks like a port name (e.g., "Cotonou", "Tema"), treat it as empty
+                    // This happens in merged rows where the next port name appears in the remark position
+                    $knownAfricanPorts = ['Apapa', 'Lagos', 'Onne', 'Tema', 'Lome', 'Cotonou', 'Abidjan', 'Douala',
+                                          'Mombasa', 'Dar Es Salaam', 'Zanzibar', 'Durban', 'Capetown',
+                                          'Maputo', 'Beira', 'Nacala', 'Toamasina', 'Tamatave', 'Reunion', 'Port Louis'];
+
+                    $isPortName = false;
+                    foreach ($knownAfricanPorts as $portName) {
+                        if (stripos($remarkCell, $portName) !== false) {
+                            $isPortName = true;
+                            break;
+                        }
+                    }
+
+                    // If remarkCell is empty or is a port name, add default
+                    $finalRemark = (!empty($remarkCell) && !$isPortName) ? $remarkCell : 'Rates are subject to local charges at both ends.';
+
+                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
                         'T/T' => !empty($tt) ? $tt : 'TBA',
                         'T/S' => !empty($ts) ? $ts : 'TBA',
                         'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
                         'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'REMARK' => implode(', ', array_filter($remarkParts)),
+                        'REMARK' => $finalRemark,
                     ]);
                 }
             } elseif (count($portCodes) == 1) {
@@ -4205,6 +4247,7 @@ class RateExtractionService
                 $pod = trim($cells[$codeIdx - 1] ?? '');
 
                 // Rates are in cells after code
+                // AFRICA REQUIREMENT: Keep FULL rate text (don't parse it)
                 $rate20Raw = trim($cells[$codeIdx + 1] ?? '');
                 $rate40Raw = trim($cells[$codeIdx + 2] ?? '');
                 $tt = trim($cells[$codeIdx + 3] ?? '');
@@ -4215,24 +4258,19 @@ class RateExtractionService
                 // Skip if port name is empty or looks like header
                 if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|^PORTs$|^CODE$)/i', $pod)) continue;
 
-                // Parse rates
-                $parsed20 = $this->parsePilRate($rate20Raw);
-                $parsed40 = $this->parsePilRate($rate40Raw);
+                // AFRICA: Use raw rates (keep full text)
+                $rate20 = str_replace(',', '', $rate20Raw);
+                $rate40 = str_replace(',', '', $rate40Raw);
 
-                // Build remark
-                $remarkParts = [];
-                if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
-                if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
-                    $remarkParts[] = $parsed40['remark'];
-                }
-                if (!empty($remarkCell)) $remarkParts[] = $remarkCell;
+                // AFRICA: Remark comes ONLY from remark cell
+                $finalRemark = !empty($remarkCell) ? $remarkCell : 'Rates are subject to local charges at both ends.';
 
-                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
                     'T/T' => !empty($tt) ? $tt : 'TBA',
                     'T/S' => !empty($ts) ? $ts : 'TBA',
                     'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => implode(', ', array_filter($remarkParts)),
+                    'REMARK' => $finalRemark,
                 ]);
             } else {
                 // Single destination in row - use original logic
@@ -4243,30 +4281,85 @@ class RateExtractionService
                 $tt = trim($cells[4] ?? '');
                 $ts = trim($cells[5] ?? '');
                 $freeTime = trim($cells[6] ?? '');
+                // Remark is after free time in this format
+                $remarkCell = trim($cells[7] ?? '');
 
                 // Skip empty or header-like rows
                 if (empty($pod) || preg_match('/(Validity|Rates quotation|Note|RATE IN USD|20\'GP|40\'HC|^PORTs$|^CODE$)/i', $pod)) continue;
 
-                // Parse rates (extract base rate and remark)
-                $parsed20 = $this->parsePilRate($rate20Raw);
-                $parsed40 = $this->parsePilRate($rate40Raw);
+                // AFRICA: Use raw rates (keep full text)
+                $rate20 = str_replace(',', '', $rate20Raw);
+                $rate40 = str_replace(',', '', $rate40Raw);
 
-                // Build remark from additional charges
-                $remarkParts = [];
-                if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
-                if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
-                    $remarkParts[] = $parsed40['remark'];
-                }
+                // AFRICA: Remark comes ONLY from remark cell
+                $finalRemark = !empty($remarkCell) ? $remarkCell : 'Rates are subject to local charges at both ends.';
 
-                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
+                $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
                     'T/T' => !empty($tt) ? $tt : 'TBA',
                     'T/S' => !empty($ts) ? $ts : 'TBA',
                     'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
                     'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                    'REMARK' => implode(', ', $remarkParts),
+                    'REMARK' => $finalRemark,
                 ]);
             }
         }
+
+        // AFRICA REQUIREMENT: Sort ports by geographical region
+        // Expected order: West Africa → East Africa → South Africa → Mozambique → Indian Ocean
+        $sortedRates = $this->sortAfricaPortsByRegion($rates);
+
+        return $sortedRates;
+    }
+
+    /**
+     * Sort Africa ports by geographical region
+     *
+     * @param array $rates
+     * @return array
+     */
+    protected function sortAfricaPortsByRegion(array $rates): array
+    {
+        // Define port order by region
+        $portOrder = [
+            // West Africa (7 ports)
+            'Apapa, Lagos' => 1,
+            'Onne' => 2,
+            'Tema' => 3,
+            'Lome' => 4,
+            'Cotonou' => 5,
+            'Abidjan' => 6,
+            'Douala' => 7,
+
+            // East Africa (3 ports)
+            'Mombasa' => 8,
+            'Dar Es Salaam' => 9,
+            'Zanzibar' => 10,
+
+            // South Africa (2 ports)
+            'Durban' => 11,
+            'Capetown' => 12,
+
+            // Mozambique (3 ports)
+            'Maputo' => 13,
+            'Beira' => 14,
+            'Nacala' => 15,
+
+            // Indian Ocean Islands (3 ports)
+            'Toamasina (Tamatave)' => 16,
+            'Reunion (Pointe Des Galets)' => 17,
+            'Port Louis' => 18,
+        ];
+
+        // Sort rates based on port order
+        usort($rates, function($a, $b) use ($portOrder) {
+            $podA = $a['POD'] ?? '';
+            $podB = $b['POD'] ?? '';
+
+            $orderA = $portOrder[$podA] ?? 999;
+            $orderB = $portOrder[$podB] ?? 999;
+
+            return $orderA - $orderB;
+        });
 
         return $rates;
     }
