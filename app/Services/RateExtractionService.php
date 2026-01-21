@@ -4566,6 +4566,7 @@ class RateExtractionService
             if (!$inDataSection) continue;
 
             // Latin America format: PORTs | CODE | 20'GP | 40'HC | LSR | T/T (DAY) | T/S | POD F/T | Remark
+            // Column index:           0      1      2       3      4        5         6       7        8
             $pod = trim($cells[0] ?? '');
             $code = trim($cells[1] ?? '');
             $rate20Raw = trim($cells[2] ?? '');
