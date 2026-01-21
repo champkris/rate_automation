@@ -4580,22 +4580,66 @@ class RateExtractionService
             // Skip empty or header-like rows
             if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
 
-            // Detect OCR anomaly: If col 7 looks like a remark (contains "Subj."), then POD F/T is missing
-            // In this case, col 7 is actually the PDF Remark, and FREE TIME should be extracted from T/S
-            $isOcrAnomaly = !empty($podFT) && (stripos($podFT, 'Subj.') !== false || stripos($podFT, 'ISD') !== false);
+            // Detect OCR anomalies - three possible merge scenarios:
+            // Case A: T/S + POD F/T merged (most common - Buenos Aires case)
+            // Case B: T/T + T/S merged
+            // Case C: POD F/T + Remark merged
 
-            if ($isOcrAnomaly) {
-                // Buenos Aires case: POD F/T column missing in OCR
-                // Col 6 (T/S) contains both location and time: "SIN 8 days"
-                // Col 7 (podFT) is actually the PDF Remark: "Subj. ISD USD18/Box ( Cnee a/c )"
-                // Col 8 (pdfRemark) is empty
-                $pdfRemark = $podFT;  // Move col 7 to PDF Remark
+            // Case A Detection: T/S merged with POD F/T
+            // (1) col 6 (T/S) contains digits - T/S should only have letters/slashes (e.g., "SIN", "SGSIN/CNTAO")
+            // (2) col 7 (podFT) contains remark keywords - indicates POD F/T is missing, col 7 is actually Remark
+            $tsHasNumbers = !empty($ts) && preg_match('/\d/', $ts);
+            $podFtLooksLikeRemark = !empty($podFT) && (stripos($podFT, 'Subj.') !== false || stripos($podFT, 'ISD') !== false);
+            $isCaseA = $podFtLooksLikeRemark && $tsHasNumbers;
 
-                // Extract FREE TIME from T/S (extract the "X days" part)
-                if (preg_match('/(\d+\s*days)$/i', $ts, $matches)) {
-                    $podFT = trim($matches[1]);
+            // Case B Detection: T/T merged with T/S
+            // (1) col 5 (T/T) ends with location codes (SIN, HCM, JKT, etc.) - indicates T/S was merged
+            // (2) col 6 (T/S) contains time pattern "X days" - indicates it's actually POD F/T
+            $ttEndsWithLocation = !empty($tt) && preg_match('/(SIN|HCM|JKT|BKK|SGN|SGSIN|CNTAO|CNSHK)$/i', $tt);
+            $tsLooksLikeTime = !empty($ts) && preg_match('/^\d+\s*days$/i', $ts);
+            $isCaseB = $ttEndsWithLocation && $tsLooksLikeTime;
+
+            // Case C Detection: POD F/T merged with Remark
+            // (1) col 7 (podFT) starts with time pattern "X days" then has remark keywords
+            // (2) col 8 (pdfRemark) is empty - indicates Remark was merged into col 7
+            $podFtHasTimeAndRemark = !empty($podFT) &&
+                                     preg_match('/^\d+\s*days.*?(Subj\.|ISD)/i', $podFT);
+            $isCaseC = $podFtHasTimeAndRemark && empty($pdfRemark);
+
+            // Fix Case A: T/S + POD F/T merged (e.g., "SIN 8 days" instead of "SIN" | "8 days")
+            if ($isCaseA) {
+                // Col 6: Contains T/S + POD F/T (e.g., "SIN 8 days")
+                // Col 7: Contains Remark (shifted left)
+                $pdfRemark = $podFT;  // Move col 7 to Remark
+
+                // Extract "X days" from end of T/S column
+                if (preg_match('/(\d+\s*days)\s*$/i', $ts, $matches)) {
+                    $podFT = trim($matches[1]);  // "SIN 8 days" → "8 days"
                 } else {
-                    $podFT = '';
+                    $podFT = $ts;  // Fallback: keep merged value
+                }
+            }
+
+            // Fix Case B: T/T + T/S merged (e.g., "35-40 days SIN" instead of "35-40 days" | "SIN")
+            elseif ($isCaseB) {
+                // Col 5: Contains T/T + T/S (e.g., "35-40 days SIN")
+                // Col 6: Contains POD F/T (correct position)
+                $podFT = $ts;  // Move col 6 to POD F/T (already correct)
+
+                // Extract location from end of T/T column
+                if (preg_match('/(SIN|HCM|JKT|BKK|SGN|SGSIN|CNTAO|CNSHK)$/i', $tt, $matches)) {
+                    $ts = trim($matches[1]);  // "35-40 days SIN" → "SIN"
+                    $tt = trim(preg_replace('/(SIN|HCM|JKT|BKK|SGN|SGSIN|CNTAO|CNSHK)\s*$/i', '', $tt));  // Remove location from T/T
+                }
+            }
+
+            // Fix Case C: POD F/T + Remark merged (e.g., "8 days Subj. ISD..." instead of "8 days" | "Subj. ISD...")
+            elseif ($isCaseC) {
+                // Col 7: Contains POD F/T + Remark (e.g., "8 days Subj. ISD...")
+                // Extract time from beginning, rest is remark
+                if (preg_match('/^(\d+\s*days)\s*(.+)$/i', $podFT, $matches)) {
+                    $podFT = trim($matches[1]);      // "8 days"
+                    $pdfRemark = trim($matches[2]);  // "Subj. ISD..."
                 }
             }
 
