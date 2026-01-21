@@ -4539,16 +4539,24 @@ class RateExtractionService
         $rates = [];
         $inDataSection = false;
         $currentPol = 'BKK/LCH';  // Default POL
+        $currentRegion = 'WCSA';  // Default region (West Coast South America)
 
         foreach ($lines as $line) {
             if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
 
             $cells = explode(' | ', $matches[1]);
 
-            // Detect section headers for POL BEFORE checking cell count
+            // Detect section headers for POL and Region BEFORE checking cell count
             // Section headers start with "Ex" followed by port codes (e.g., "Ex BKK / SHT / LCH", "WCSA Ex BKK / LCH")
             // This approach handles any POL combination (BKK/LCH, BKK/SHT/LCH, SHT/LCH, HKG/LCH, etc.)
             $cellContent = trim($cells[0] ?? '');
+
+            // Detect region (WCSA or ECSA)
+            if (preg_match('/^(WCSA|ECSA)\s+Ex\s+/i', $cellContent, $regionMatches)) {
+                $currentRegion = strtoupper($regionMatches[1]);  // "WCSA" or "ECSA"
+            }
+
+            // Detect POL
             if (preg_match('/Ex\s+(.+)$/i', $cellContent, $polMatches)) {
                 // Extract everything after "Ex" (e.g., "BKK / SHT / LCH")
                 $polText = trim($polMatches[1]);
@@ -4676,18 +4684,34 @@ class RateExtractionService
                 $remark = 'Rates are subject to local charges at both ends.';
             }
 
-            $rates[] = $this->createRateEntry('PIL', $currentPol, $pod, $rate20, $rate40, [
+            $rateEntry = $this->createRateEntry('PIL', $currentPol, $pod, $rate20, $rate40, [
                 'T/T' => !empty($tt) ? $tt : 'TBA',             // T/T (DAY) from col 5
                 'T/S' => !empty($ts) ? $ts : 'TBA',             // T/S from col 6
                 'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
                 'REMARK' => $remark,
             ]);
+
+            // Add region for sorting (WCSA or ECSA)
+            $rateEntry['_section'] = $currentRegion;
+
+            $rates[] = $rateEntry;
         }
+
+        // Sort rates: WCSA ports first, then ECSA ports (to match correct Excel order)
+        usort($rates, function($a, $b) {
+            // WCSA should come before ECSA
+            $regionOrder = ['WCSA' => 1, 'ECSA' => 2];
+            $aOrder = $regionOrder[$a['_section'] ?? 'WCSA'] ?? 1;
+            $bOrder = $regionOrder[$b['_section'] ?? 'WCSA'] ?? 1;
+            return $aOrder <=> $bOrder;
+        });
 
         // Add region metadata for filename generation
         foreach ($rates as &$rate) {
             $rate['_region'] = 'Latin_America';
+            // Remove _section as it's no longer needed
+            unset($rate['_section']);
         }
 
         return $rates;
