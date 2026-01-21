@@ -4553,39 +4553,75 @@ class RateExtractionService
 
             if (!$inDataSection) continue;
 
-            // Latin America format: PORT | CODE | 20' | 40' | T/T | T/S | FREE TIME | LSR
+            // Latin America format: PORTs | CODE | 20'GP | 40'HC | LSR | T/T (DAY) | T/S | POD F/T | Remark
             $pod = trim($cells[0] ?? '');
             $code = trim($cells[1] ?? '');
             $rate20Raw = trim($cells[2] ?? '');
             $rate40Raw = trim($cells[3] ?? '');
-            $tt = trim($cells[4] ?? '');
-            $ts = trim($cells[5] ?? '');
-            $freeTime = trim($cells[6] ?? '');
-            $lsr = trim($cells[7] ?? '');
+            $lsr = trim($cells[4] ?? '');       // LSR value (e.g., "108/216", "78/156")
+            $tt = trim($cells[5] ?? '');        // T/T (DAY) value (e.g., "35 - 40 days")
+            $ts = trim($cells[6] ?? '');        // T/S value (e.g., "SIN", "SGSIN/CNTAO")
+            $podFT = trim($cells[7] ?? '');     // POD F/T value (e.g., "8 days", "10 days")
+            $pdfRemark = trim($cells[8] ?? ''); // Remark value (e.g., "Subj. ISD USD18/Box ( Cnee a/c )")
 
             // Skip empty or header-like rows
             if (empty($pod) || preg_match('/(Validity|Rates quotation|Note)/i', $pod)) continue;
 
-            // Parse rates
-            $parsed20 = $this->parsePilRate($rate20Raw);
-            $parsed40 = $this->parsePilRate($rate40Raw);
+            // Detect OCR anomaly: If col 7 looks like a remark (contains "Subj."), then POD F/T is missing
+            // In this case, col 7 is actually the PDF Remark, and FREE TIME should be extracted from T/S
+            $isOcrAnomaly = !empty($podFT) && (stripos($podFT, 'Subj.') !== false || stripos($podFT, 'ISD') !== false);
 
-            // Build remark from additional charges + LSR
+            if ($isOcrAnomaly) {
+                // Buenos Aires case: POD F/T column missing in OCR
+                // Col 6 (T/S) contains both location and time: "SIN 8 days"
+                // Col 7 (podFT) is actually the PDF Remark: "Subj. ISD USD18/Box ( Cnee a/c )"
+                // Col 8 (pdfRemark) is empty
+                $pdfRemark = $podFT;  // Move col 7 to PDF Remark
+
+                // Extract FREE TIME from T/S (extract the "X days" part)
+                if (preg_match('/(\d+\s*days)$/i', $ts, $matches)) {
+                    $podFT = trim($matches[1]);
+                } else {
+                    $podFT = '';
+                }
+            }
+
+            // Extract rate: remove commas only, keep "( LSR included )" and "+ AMS"
+            $rate20 = str_replace(',', '', $rate20Raw);
+            $rate20 = trim($rate20);
+
+            $rate40 = str_replace(',', '', $rate40Raw);
+            $rate40 = trim($rate40);
+
+            // Build FREE TIME from POD F/T (col 7)
+            $freeTime = $podFT;
+
+            // Build REMARK (Format: "LSR {col 4}" [+ ", {col 8}"])
             $remarkParts = [];
-            if (!empty($parsed20['remark'])) $remarkParts[] = $parsed20['remark'];
-            if (!empty($parsed40['remark']) && $parsed40['remark'] !== $parsed20['remark']) {
-                $remarkParts[] = $parsed40['remark'];
-            }
+
+            // Always add "LSR {LSR value}"
             if (!empty($lsr)) {
-                $remarkParts[] = 'LSR: ' . $lsr;
+                $remarkParts[] = 'LSR ' . $lsr;
             }
 
-            $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $parsed20['rate'], $parsed40['rate'], [
-                'T/T' => !empty($tt) ? $tt : 'TBA',
-                'T/S' => !empty($ts) ? $ts : 'TBA',
+            // If PDF Remark exists and not "-", append it
+            if (!empty($pdfRemark) && $pdfRemark !== '-') {
+                $remarkParts[] = $pdfRemark;
+            }
+
+            $remark = implode(', ', $remarkParts);
+
+            // Default remark if empty
+            if (empty($remark)) {
+                $remark = 'Rates are subject to local charges at both ends.';
+            }
+
+            $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
+                'T/T' => !empty($tt) ? $tt : 'TBA',             // T/T (DAY) from col 5
+                'T/S' => !empty($ts) ? $ts : 'TBA',             // T/S from col 6
                 'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
                 'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                'REMARK' => implode(', ', $remarkParts),
+                'REMARK' => $remark,
             ]);
         }
 
