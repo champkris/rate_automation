@@ -4546,11 +4546,14 @@ class RateExtractionService
             $cells = explode(' | ', $matches[1]);
 
             // Detect section headers for POL BEFORE checking cell count
-            // (e.g., "Ex BKK / SHT / LCH", "WCSA Ex BKK / LCH")
+            // Section headers start with "Ex" followed by port codes (e.g., "Ex BKK / SHT / LCH", "WCSA Ex BKK / LCH")
+            // This approach handles any POL combination (BKK/LCH, BKK/SHT/LCH, SHT/LCH, HKG/LCH, etc.)
             $cellContent = trim($cells[0] ?? '');
-            if (preg_match('/Ex\s+(BKK\s*\/\s*.+)$/i', $cellContent, $polMatches)) {
+            if (preg_match('/Ex\s+(.+)$/i', $cellContent, $polMatches)) {
+                // Extract everything after "Ex" (e.g., "BKK / SHT / LCH")
                 $polText = trim($polMatches[1]);
-                $currentPol = str_replace(' ', '', $polText);  // "BKK / SHT / LCH" → "BKK/SHT/LCH"
+                // Remove all spaces to normalize format: "BKK / SHT / LCH" → "BKK/SHT/LCH"
+                $currentPol = str_replace(' ', '', $polText);
                 continue;
             }
 
