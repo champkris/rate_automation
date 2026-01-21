@@ -4538,11 +4538,23 @@ class RateExtractionService
     {
         $rates = [];
         $inDataSection = false;
+        $currentPol = 'BKK/LCH';  // Default POL
 
         foreach ($lines as $line) {
             if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
 
             $cells = explode(' | ', $matches[1]);
+
+            // Detect section headers for POL BEFORE checking cell count
+            // (e.g., "Ex BKK / SHT / LCH", "WCSA Ex BKK / LCH")
+            $cellContent = trim($cells[0] ?? '');
+            if (preg_match('/Ex\s+(BKK\s*\/\s*.+)$/i', $cellContent, $polMatches)) {
+                $polText = trim($polMatches[1]);
+                $currentPol = str_replace(' ', '', $polText);  // "BKK / SHT / LCH" → "BKK/SHT/LCH"
+                continue;
+            }
+
+            // Check cell count after POL detection (headers have only 1 cell)
             if (count($cells) < 5) continue;
 
             // Skip header rows
@@ -4616,7 +4628,7 @@ class RateExtractionService
                 $remark = 'Rates are subject to local charges at both ends.';
             }
 
-            $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod, $rate20, $rate40, [
+            $rates[] = $this->createRateEntry('PIL', $currentPol, $pod, $rate20, $rate40, [
                 'T/T' => !empty($tt) ? $tt : 'TBA',             // T/T (DAY) from col 5
                 'T/S' => !empty($ts) ? $ts : 'TBA',             // T/S from col 6
                 'FREE TIME' => !empty($freeTime) ? $freeTime : 'TBA',
