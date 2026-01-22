@@ -306,6 +306,15 @@ class RateExtractionService
                     // Fallback: detect region from filename
                     array_unshift($lines, "Trade: " . $matches[1]);
                 }
+
+                // Also add Validity information for regions with multiple validities (like Oceania)
+                // Extract all "Validity : DD-DD Month YYYY" patterns
+                if (preg_match_all('/Validity\s*:\s*\n?\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $fullText, $validityMatches, PREG_SET_ORDER)) {
+                    foreach ($validityMatches as $validityMatch) {
+                        $validityLine = "Validity: " . $validityMatch[1] . '-' . $validityMatch[2] . ' ' . $validityMatch[3] . ' ' . $validityMatch[4];
+                        array_unshift($lines, $validityLine);
+                    }
+                }
             }
 
             // Cache the results for future use
@@ -4724,90 +4733,164 @@ class RateExtractionService
     protected function parsePilOceaniaTable(array $lines, string $validity): array
     {
         $rates = [];
-        $inDataSection = false;
+        $lastRemarkLeft = '';   // For merged cells on left side (NZ)
+        $lastRemarkRight = '';  // For merged cells on right side (AU)
 
+        // Parse validity from prepended validity lines (added by extractFromPdf)
+        $validityAustralia = '';
+        $validityNZ = '';
+
+        // Look for Validity lines added by extractFromPdf
         foreach ($lines as $line) {
+            if (preg_match('/^Validity:\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $line, $match)) {
+                // Convert month to 3-letter code
+                $monthMap = [
+                    'january' => 'JAN', 'february' => 'FEB', 'march' => 'MAR',
+                    'april' => 'APR', 'may' => 'MAY', 'june' => 'JUN',
+                    'july' => 'JUL', 'august' => 'AUG', 'september' => 'SEP',
+                    'october' => 'OCT', 'november' => 'NOV', 'december' => 'DEC',
+                ];
+                $monthCode = $monthMap[strtolower($match[3])];
+                $validityStr = $match[1] . '-' . $match[2] . '  ' . $monthCode . ' ' . $match[4];
+
+                if ($match[1] === '04') {
+                    $validityAustralia = $validityStr;
+                } elseif ($match[1] === '01') {
+                    $validityNZ = $validityStr;
+                }
+            }
+        }
+
+        // If we didn't find specific validities, use the provided one
+        if (empty($validityAustralia)) $validityAustralia = $validity;
+        if (empty($validityNZ)) $validityNZ = $validity;
+
+        foreach ($lines as $lineIndex => $line) {
             if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
 
             $cells = explode(' | ', $matches[1]);
 
             // Skip header rows
             if (preg_match('/(PORTs|CODE|RATE IN USD)/i', $cells[0] ?? '')) {
-                $inDataSection = true;
                 continue;
             }
 
-            if (!$inDataSection) continue;
-
-            // Skip size header row (20'GP | 40'GP | 40'HC | ...)
-            if (preg_match('/^(20\'|40\')/i', $cells[0] ?? '')) continue;
-
-            // Oceania has side-by-side layout:
-            // Left destination (cells 0-8) | Right destination (cells 9-17)
-            // Each side: PORT | CODE | 20' | 40' | 40'HQ | T/T | T/S | F/T | REMARK
-
-            if (count($cells) >= 9) {
-                // Process left destination
-                $pod1 = trim($cells[0] ?? '');
-                $code1 = trim($cells[1] ?? '');
-                $rate20Raw1 = trim($cells[2] ?? '');
-                $rate40Raw1 = trim($cells[3] ?? '');
-                $rate40HQ1 = trim($cells[4] ?? '');
-                $tt1 = trim($cells[5] ?? '');
-                $ts1 = trim($cells[6] ?? '');
-                $freeTime1 = trim($cells[7] ?? '');
-                $remark1 = trim($cells[8] ?? '');
-
-                if (!empty($pod1) && !preg_match('/(Validity|Rates quotation|Note|PORTs)/i', $pod1)) {
-                    $parsed20_1 = $this->parsePilRate($rate20Raw1);
-                    $parsed40_1 = $this->parsePilRate($rate40Raw1);
-
-                    $remarkParts1 = [];
-                    if (!empty($remark1)) $remarkParts1[] = $remark1;
-                    if (!empty($parsed20_1['remark'])) $remarkParts1[] = $parsed20_1['remark'];
-                    if (!empty($parsed40_1['remark']) && $parsed40_1['remark'] !== $parsed20_1['remark']) {
-                        $remarkParts1[] = $parsed40_1['remark'];
-                    }
-
-                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod1, $parsed20_1['rate'], $parsed40_1['rate'], [
-                        'T/T' => !empty($tt1) ? $tt1 : 'TBA',
-                        'T/S' => !empty($ts1) ? $ts1 : 'TBA',
-                        'FREE TIME' => !empty($freeTime1) ? $freeTime1 : 'TBA',
-                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'REMARK' => implode(', ', array_filter($remarkParts1)),
-                    ]);
-                }
+            // Skip size header row (20'GP | 40'GP | 40'HC)
+            if (preg_match('/^(20\'|40\')/i', $cells[0] ?? '')) {
+                continue;
             }
 
-            if (count($cells) >= 17) {
-                // Process right destination (cells 9-16, cell 17 is optional remark)
-                $pod2 = trim($cells[9] ?? '');
-                $code2 = trim($cells[10] ?? '');
-                $rate20Raw2 = trim($cells[11] ?? '');
-                $rate40Raw2 = trim($cells[12] ?? '');
-                $rate40HQ2 = trim($cells[13] ?? '');
-                $tt2 = trim($cells[14] ?? '');
-                $ts2 = trim($cells[15] ?? '');
-                $freeTime2 = trim($cells[16] ?? '');
-                $remark2 = trim($cells[17] ?? '');  // Optional - may not exist in OCR
+            // Oceania has side-by-side layout BUT with dynamic column shifting:
+            // Left side (NZ): cells 0-7 (or 0-8 if remark exists) → PORT | CODE | 20' | 40' | 40HC | T/T | T/S | F/T | [REMARK]
+            // Right side (AU): starts at cell 8 or 9 depending on whether left has remark
 
-                if (!empty($pod2) && !preg_match('/(Validity|Rates quotation|Note|PORTs)/i', $pod2)) {
-                    $parsed20_2 = $this->parsePilRate($rate20Raw2);
-                    $parsed40_2 = $this->parsePilRate($rate40Raw2);
+            // Process LEFT side (New Zealand)
+            $pod1 = trim($cells[0] ?? '');
+            $code1 = trim($cells[1] ?? '');
+            $rate20_1 = trim($cells[2] ?? '');
+            $rate40_1 = trim($cells[3] ?? '');
+            $rate40HQ1 = trim($cells[4] ?? '');
+            $tt1 = trim($cells[5] ?? '');
+            $ts1 = trim($cells[6] ?? '');
+            $freeTime1 = trim($cells[7] ?? '');
 
-                    $remarkParts2 = [];
-                    if (!empty($remark2)) $remarkParts2[] = $remark2;
-                    if (!empty($parsed20_2['remark'])) $remarkParts2[] = $parsed20_2['remark'];
-                    if (!empty($parsed40_2['remark']) && $parsed40_2['remark'] !== $parsed20_2['remark']) {
-                        $remarkParts2[] = $parsed40_2['remark'];
+            // Determine if cell 8 is remark (for left) or POD (for right)
+            // If cell 8 looks like a port name or code, it's the right side POD
+            // Otherwise it's the left side remark
+            $cell8 = trim($cells[8] ?? '');
+            $leftHasRemark = false;
+            $remark1 = '';
+            $rightStartIndex = 8;  // Default: right side starts at cell 8
+
+            // Check if cell 8 is a port name (starts with uppercase letters, not a remark phrase)
+            // Port names: Brisbane, Sydney, Melbourne, Fremantle, Adelaide
+            if (preg_match('/^[A-Z][a-z]+$/', $cell8) || preg_match('/^AU[A-Z]{3}$/', $cell8)) {
+                // Cell 8 is a port name, so left has NO remark
+                $leftHasRemark = false;
+                $remark1 = '';
+                $rightStartIndex = 8;
+            } else {
+                // Cell 8 is a remark for left side
+                $leftHasRemark = true;
+                $remark1 = $cell8;
+                $rightStartIndex = 9;
+            }
+
+            // Save left side record if valid
+            if (!empty($pod1) && !preg_match('/(Validity|Rates quotation|Note|PORTs|Remarks)/i', $pod1)) {
+                // Convert n/a to TBA
+                if (preg_match('/^n\s*\/\s*a$/i', $rate20_1)) $rate20_1 = 'TBA';
+                if (preg_match('/^n\s*\/\s*a$/i', $rate40_1)) $rate40_1 = 'TBA';
+                if (preg_match('/^n\s*\/\s*a$/i', $rate40HQ1)) $rate40HQ1 = 'TBA';
+
+                // Remove commas from rates (OCR adds thousand separators)
+                $rate20_1 = str_replace(',', '', $rate20_1);
+                $rate40_1 = str_replace(',', '', $rate40_1);
+                $rate40HQ1 = str_replace(',', '', $rate40HQ1);
+
+                // Handle merged remark cells
+                if (empty($remark1) && !empty($lastRemarkLeft)) {
+                    $remark1 = $lastRemarkLeft;
+                } elseif (!empty($remark1)) {
+                    $lastRemarkLeft = $remark1;
+                }
+
+                $rates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod1, $rate20_1, $rate40_1, [
+                    '40 HQ' => $rate40HQ1,
+                    'T/T' => !empty($tt1) ? $tt1 : '',
+                    'T/S' => !empty($ts1) ? $ts1 : '',
+                    'FREE TIME' => !empty($freeTime1) ? $freeTime1 : '',
+                    'VALIDITY' => $validityNZ,
+                    'REMARK' => $remark1,
+                ]);
+            }
+
+            // Process RIGHT side (Australia)
+            // Right side starts at $rightStartIndex (either 8 or 9)
+            if (count($cells) >= $rightStartIndex + 8) {  // Need at least 8 cells for complete record
+                $pod2 = trim($cells[$rightStartIndex] ?? '');
+                $code2 = trim($cells[$rightStartIndex + 1] ?? '');
+                $rate20_2 = trim($cells[$rightStartIndex + 2] ?? '');
+                $rate40_2 = trim($cells[$rightStartIndex + 3] ?? '');
+                $rate40HQ2 = trim($cells[$rightStartIndex + 4] ?? '');
+                $tt2 = trim($cells[$rightStartIndex + 5] ?? '');
+                $ts2 = trim($cells[$rightStartIndex + 6] ?? '');
+                $freeTime2 = trim($cells[$rightStartIndex + 7] ?? '');
+                $remark2 = trim($cells[$rightStartIndex + 8] ?? '');
+
+                if (!empty($pod2) && !preg_match('/(Validity|Rates quotation|Note|PORTs|Remarks)/i', $pod2)) {
+                    // Convert n/a to TBA
+                    if (preg_match('/^n\s*\/\s*a$/i', $rate20_2)) $rate20_2 = 'TBA';
+                    if (preg_match('/^n\s*\/\s*a$/i', $rate40_2)) $rate40_2 = 'TBA';
+                    if (preg_match('/^n\s*\/\s*a$/i', $rate40HQ2)) $rate40HQ2 = 'TBA';
+
+                    // Remove commas from rates (OCR adds thousand separators)
+                    $rate20_2 = str_replace(',', '', $rate20_2);
+                    $rate40_2 = str_replace(',', '', $rate40_2);
+                    $rate40HQ2 = str_replace(',', '', $rate40HQ2);
+
+                    // Determine POL for Australian ports based on port name
+                    // Brisbane, Sydney, Melbourne use LKR/LCH
+                    // Fremantle, Adelaide use BKK/LKR/LCH
+                    $pol2 = 'BKK/LKR/LCH';  // Default
+                    if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod2)) {
+                        $pol2 = 'LKR/LCH';
                     }
 
-                    $rates[] = $this->createRateEntry('PIL', 'BKK/LCH', $pod2, $parsed20_2['rate'], $parsed40_2['rate'], [
-                        'T/T' => !empty($tt2) ? $tt2 : 'TBA',
-                        'T/S' => !empty($ts2) ? $ts2 : 'TBA',
-                        'FREE TIME' => !empty($freeTime2) ? $freeTime2 : 'TBA',
-                        'VALIDITY' => $validity ?: strtoupper(date('M Y')),
-                        'REMARK' => implode(', ', array_filter($remarkParts2)),
+                    // Handle merged remark cells
+                    if (empty($remark2) && !empty($lastRemarkRight)) {
+                        $remark2 = $lastRemarkRight;
+                    } elseif (!empty($remark2)) {
+                        $lastRemarkRight = $remark2;
+                    }
+
+                    $rates[] = $this->createRateEntry('PIL', $pol2, $pod2, $rate20_2, $rate40_2, [
+                        '40 HQ' => $rate40HQ2,
+                        'T/T' => !empty($tt2) ? $tt2 : '',
+                        'T/S' => !empty($ts2) ? $ts2 : '',
+                        'FREE TIME' => !empty($freeTime2) ? $freeTime2 : '',
+                        'VALIDITY' => $validityAustralia,
+                        'REMARK' => $remark2,
                     ]);
                 }
             }
@@ -4815,7 +4898,7 @@ class RateExtractionService
 
         // Add region metadata for filename generation
         foreach ($rates as &$rate) {
-            $rate['_region'] = 'Oceania';
+            $rate['_region'] = 'Oceania(Australia)';
         }
 
         return $rates;
