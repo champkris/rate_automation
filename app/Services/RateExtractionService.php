@@ -257,6 +257,7 @@ class RateExtractionService
             // For PIL carrier: add Trade field from JSON or filename to help region detection
             if ($pattern === 'pil' && file_exists($jsonFile)) {
                 $jsonContent = file_get_contents($jsonFile);
+
                 // Try to extract Trade field from JSON
                 if (preg_match('/"content":\s*"Trade:\s*([^"]+)"/i', $jsonContent, $matches)) {
                     // Prepend Trade field as first line for region detection
@@ -264,6 +265,27 @@ class RateExtractionService
                 } elseif (preg_match('/(Africa|Intra Asia|Latin America|Oceania|South Asia)/i', $baseFilename, $matches)) {
                     // Fallback: detect region from filename
                     array_unshift($lines, "Trade: " . $matches[1]);
+                }
+
+                // Extract full text from cached JSON for POL mapping extraction
+                // Reconstruct full text from all "content" fields in JSON
+                $fullTextFromCache = '';
+                if (preg_match_all('/"content":\s*"([^"]+)"/i', $jsonContent, $contentMatches)) {
+                    $fullTextFromCache = implode("\n", $contentMatches[1]);
+
+                    // Unescape JSON-encoded strings (\\n becomes actual newline, \\/ becomes /)
+                    $fullTextFromCache = str_replace('\\/', '/', $fullTextFromCache);
+                    $fullTextFromCache = str_replace('\\n', "\n", $fullTextFromCache);
+                }
+
+                // Extract POL mappings for Oceania region (from cached JSON)
+                if (!empty($fullTextFromCache)) {
+                    $polMappings = $this->extractPolMappings($fullTextFromCache);
+
+                    // Prepend POL mappings to lines array for parser
+                    if (!empty($polMappings['au']) || !empty($polMappings['nz'])) {
+                        array_unshift($lines, 'POL_MAPPING:' . json_encode($polMappings));
+                    }
                 }
             }
         } else {
@@ -325,6 +347,14 @@ class RateExtractionService
                         $validityLine = "ValidityCross: " . $match[1] . ' ' . $match[2] . ' - ' . $match[3] . ' ' . $match[4] . ' ' . $match[5];
                         array_unshift($lines, $validityLine);
                     }
+                }
+
+                // Extract POL mappings for Oceania region (dynamic extraction from PDF text)
+                $polMappings = $this->extractPolMappings($fullText);
+
+                // Prepend POL mappings to lines array for parser
+                if (!empty($polMappings['au']) || !empty($polMappings['nz'])) {
+                    array_unshift($lines, 'POL_MAPPING:' . json_encode($polMappings));
                 }
             }
 
@@ -4739,6 +4769,72 @@ class RateExtractionService
     }
 
     /**
+     * Extract POL mappings from OCR full text
+     *
+     * Extracts dynamic POL-to-port mappings from PDF header text:
+     * - Australia: "Ex LKR/LCH - Brisbane / Sydney / Melbourne : Ex BKK/LKR/LCH - Fremantle / Adelaide"
+     * - New Zealand: "New Zealand ... Ex BKK/LKR/LCH"
+     *
+     * @param string $fullText OCR full text from PDF
+     * @return array ['au' => ['Brisbane' => 'LKR/LCH', ...], 'nz' => 'BKK/LKR/LCH']
+     */
+    protected function extractPolMappings(string $fullText): array
+    {
+        $mappings = [
+            'au' => [],
+            'nz' => 'BKK/LKR/LCH'  // Default fallback
+        ];
+
+        // Pattern 1: Australia dual POL mapping
+        // Matches: "Ex LKR/LCH - Brisbane / Sydney / Melbourne : Ex BKK/LKR/LCH - Fremantle / Adelaide"
+        // Regex breakdown:
+        //   - Ex\s+([A-Z\/]+): Captures first POL (LKR/LCH)
+        //   - \s*-\s*: Dash with optional spaces
+        //   - ([^:]+): Captures all ports until colon (Brisbane / Sydney / Melbourne)
+        //   - \s*:\s*: Colon separator with optional spaces
+        //   - Ex\s+([A-Z\/]+): Captures second POL (BKK/LKR/LCH)
+        //   - \s*-\s*: Dash with optional spaces
+        //   - ([^:\n]+): Captures second port list until colon/newline (Fremantle / Adelaide)
+        if (preg_match('/Ex\s+([A-Z\/]+)\s*-\s*([^:]+)\s*:\s*Ex\s+([A-Z\/]+)\s*-\s*([^:\n]+)/i',
+            $fullText, $match)) {
+
+            $pol1 = trim($match[1]);          // First POL: LKR/LCH
+            $ports1Text = trim($match[2]);    // "Brisbane / Sydney / Melbourne"
+            $pol2 = trim($match[3]);          // Second POL: BKK/LKR/LCH
+            $ports2Text = trim($match[4]);    // "Fremantle / Adelaide"
+
+            // Parse port names (split by '/' and trim)
+            $ports1 = array_filter(array_map('trim', explode('/', $ports1Text)));
+            $ports2 = array_filter(array_map('trim', explode('/', $ports2Text)));
+
+            // Build mapping: port name => POL
+            foreach ($ports1 as $port) {
+                if (!empty($port)) {
+                    $mappings['au'][$port] = $pol1;
+                }
+            }
+            foreach ($ports2 as $port) {
+                if (!empty($port)) {
+                    $mappings['au'][$port] = $pol2;
+                }
+            }
+        }
+
+        // Pattern 2: New Zealand POL (dynamic extraction)
+        // Finds "New Zealand" then extracts next "Ex [POL]"
+        // Regex breakdown:
+        //   - New Zealand: Literal text
+        //   - .*?: Non-greedy match of any characters (minimum between "New Zealand" and "Ex")
+        //   - Ex\s+([A-Z\/]+): Captures POL code after "Ex"
+        //   - /is flags: i=case insensitive, s=dot matches newlines
+        if (preg_match('/New Zealand.*?Ex\s+([A-Z\/]+)/is', $fullText, $match)) {
+            $mappings['nz'] = trim($match[1]);  // Extract whatever POL is specified
+        }
+
+        return $mappings;
+    }
+
+    /**
      * Parse PIL Oceania region format (side-by-side layout with 2 destinations per row)
      */
     protected function parsePilOceaniaTable(array $lines, string $validity): array
@@ -4747,6 +4843,23 @@ class RateExtractionService
         $rightRates = [];  // Australia ports
         $lastRemarkLeft = '';   // For merged cells on left side (NZ)
         $lastRemarkRight = '';  // For merged cells on right side (AU)
+
+        // Parse POL mappings from prepended line (added by extractFromPdf)
+        $polMappings = [
+            'au' => [],
+            'nz' => 'BKK/LKR/LCH'  // Default fallback
+        ];
+
+        foreach ($lines as $line) {
+            if (strpos($line, 'POL_MAPPING:') === 0) {
+                $json = substr($line, strlen('POL_MAPPING:'));
+                $decoded = json_decode($json, true);
+                if ($decoded !== null) {
+                    $polMappings = $decoded;
+                }
+                break;  // Only one POL_MAPPING line expected
+            }
+        }
 
         // Parse validity from prepended validity lines (added by extractFromPdf)
         $validityAustralia = '';
@@ -4970,11 +5083,9 @@ class RateExtractionService
 
                 // Determine POL and validity based on which side this is
                 if ($leftIsAustralia) {
-                    // Left side is Australia
-                    $pol1 = 'BKK/LKR/LCH';  // Default
-                    if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod1)) {
-                        $pol1 = 'LKR/LCH';
-                    }
+                    // Left side is Australia - use dynamic POL mapping
+                    // Look up in extracted mapping, fallback to regional default
+                    $pol1 = $polMappings['au'][$pod1] ?? 'BKK/LKR/LCH';
                     $validity1 = $validityAustralia;
                     $rightRates[] = $this->createRateEntry('PIL', $pol1, $pod1, $rate20_1, $rate40_1, [
                         '40 HQ' => $rate40HQ1,
@@ -4985,8 +5096,8 @@ class RateExtractionService
                         'REMARK' => $remark1,
                     ]);
                 } else {
-                    // Left side is New Zealand
-                    $leftRates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod1, $rate20_1, $rate40_1, [
+                    // Left side is New Zealand - use extracted NZ POL (already contains fallback)
+                    $leftRates[] = $this->createRateEntry('PIL', $polMappings['nz'], $pod1, $rate20_1, $rate40_1, [
                         '40 HQ' => $rate40HQ1,
                         'T/T' => !empty($tt1) ? $tt1 : '',
                         'T/S' => !empty($ts1) ? $ts1 : '',
@@ -5030,11 +5141,9 @@ class RateExtractionService
 
                     // Determine POL and validity based on which side this is
                     if ($rightIsAustralia) {
-                        // Right side is Australia
-                        $pol2 = 'BKK/LKR/LCH';  // Default
-                        if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod2)) {
-                            $pol2 = 'LKR/LCH';
-                        }
+                        // Right side is Australia - use dynamic POL mapping
+                        // Look up in extracted mapping, fallback to regional default
+                        $pol2 = $polMappings['au'][$pod2] ?? 'BKK/LKR/LCH';
                         $validity2 = $validityAustralia;
                         $rightRates[] = $this->createRateEntry('PIL', $pol2, $pod2, $rate20_2, $rate40_2, [
                             '40 HQ' => $rate40HQ2,
@@ -5045,8 +5154,8 @@ class RateExtractionService
                             'REMARK' => $remark2,
                         ]);
                     } else {
-                        // Right side is New Zealand
-                        $leftRates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod2, $rate20_2, $rate40_2, [
+                        // Right side is New Zealand - use extracted NZ POL (already contains fallback)
+                        $leftRates[] = $this->createRateEntry('PIL', $polMappings['nz'], $pod2, $rate20_2, $rate40_2, [
                             '40 HQ' => $rate40HQ2,
                             'T/T' => !empty($tt2) ? $tt2 : '',
                             'T/S' => !empty($ts2) ? $ts2 : '',
