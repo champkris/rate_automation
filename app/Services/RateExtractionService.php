@@ -4626,6 +4626,7 @@ class RateExtractionService
                 // Extract "X days" from end of T/S column
                 if (preg_match('/(\d+\s*days)\s*$/i', $ts, $matches)) {
                     $podFT = trim($matches[1]);  // "SIN 8 days" → "8 days"
+                    $ts = trim(preg_replace('/\s*\d+\s*days\s*$/i', '', $ts));  // Remove "8 days" from T/S → "SIN"
                 } else {
                     $podFT = $ts;  // Fallback: keep merged value
                 }
