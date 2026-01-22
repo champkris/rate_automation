@@ -332,10 +332,13 @@ class RateExtractionService
                 // Also add Validity information for regions with multiple validities (like Oceania)
                 // Extract all "Validity : DD-DD Month YYYY" patterns (including cross-month ranges)
 
-                // Pattern 1: Same month range (e.g., "04-14 January 2026")
+                // Pattern 1: Same month range (e.g., "04-14 January 2026", "4-14 JAN 2026")
                 // Use [\s\n]* to handle any whitespace including newlines between colon and date
-                if (preg_match_all('/Validity\s*:[\s\n]*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $fullText, $validityMatches, PREG_SET_ORDER)) {
+                // Accept \d{1,2} for flexible date format (handles both "4" and "04")
+                // Accept [A-Za-z]+ for any month format (full names, abbreviations, or misspellings)
+                if (preg_match_all('/Validity\s*:[\s\n]*(\d{1,2})-(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/i', $fullText, $validityMatches, PREG_SET_ORDER)) {
                     foreach ($validityMatches as $validityMatch) {
+                        // Keep month as-is; will normalize in Stage 2 (parsePilOceaniaTable)
                         $validityLine = "Validity: " . $validityMatch[1] . '-' . $validityMatch[2] . ' ' . $validityMatch[3] . ' ' . $validityMatch[4];
                         array_unshift($lines, $validityLine);
                     }
@@ -4867,7 +4870,8 @@ class RateExtractionService
         $validityAustraliaDays = 0;
         $validityNZDays = 0;
 
-        // Month to number mapping for date calculations
+        // Enhanced month to number mapping for date calculations
+        // Supports both full names and abbreviations
         $monthToNum = [
             'jan' => 1, 'january' => 1,
             'feb' => 2, 'february' => 2,
@@ -4883,6 +4887,22 @@ class RateExtractionService
             'dec' => 12, 'december' => 12,
         ];
 
+        // Enhanced month map for output (month text -> 3-letter code)
+        // Used for normalizing various month formats to standard 3-letter codes
+        $monthMap = [
+            // Full month names
+            'january' => 'JAN', 'february' => 'FEB', 'march' => 'MAR',
+            'april' => 'APR', 'may' => 'MAY', 'june' => 'JUN',
+            'july' => 'JUL', 'august' => 'AUG', 'september' => 'SEP',
+            'october' => 'OCT', 'november' => 'NOV', 'december' => 'DEC',
+
+            // Abbreviated forms
+            'jan' => 'JAN', 'feb' => 'FEB', 'mar' => 'MAR',
+            'apr' => 'APR', 'jun' => 'JUN',
+            'jul' => 'JUL', 'aug' => 'AUG', 'sep' => 'SEP',
+            'oct' => 'OCT', 'nov' => 'NOV', 'dec' => 'DEC',
+        ];
+
         // Month to 3-letter code
         $monthTo3Letter = [
             1 => 'JAN', 2 => 'FEB', 3 => 'MAR', 4 => 'APR', 5 => 'MAY', 6 => 'JUN',
@@ -4893,11 +4913,37 @@ class RateExtractionService
         $foundValidities = [];
 
         foreach ($lines as $line) {
-            // Pattern 1: Same month range (e.g., "Validity: 04-14 January 2026")
-            if (preg_match('/^Validity:\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $line, $match)) {
-                $monthCode = $monthTo3Letter[$monthToNum[strtolower($match[3])]];
-                $validityStr = $match[1] . '-' . $match[2] . '  ' . $monthCode . ' ' . $match[4];
-                $dayRange = intval($match[2]) - intval($match[1]);
+            // Pattern 1: Same month range (e.g., "Validity: 04-14 January 2026", "Validity: 4-14 JAN 2026")
+            // Now accepts \d{1,2} for flexible dates and [A-Za-z]+ for any month format
+            if (preg_match('/^Validity:\s*(\d{1,2})-(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/i', $line, $match)) {
+                $monthText = strtolower(trim($match[3]));
+
+                // Try exact match first
+                if (isset($monthMap[$monthText])) {
+                    $monthCode = $monthMap[$monthText];
+                } else {
+                    // Fallback: Try partial match (for misspellings like "Janu" -> "january")
+                    $monthCode = null;
+                    $firstThreeChars = substr($monthText, 0, 3);
+                    foreach ($monthMap as $key => $value) {
+                        if (strpos($key, $firstThreeChars) === 0) {
+                            $monthCode = $value;
+                            break;
+                        }
+                    }
+
+                    // Ultimate fallback: Uppercase first 3 letters if no match
+                    if ($monthCode === null) {
+                        $monthCode = strtoupper(substr($monthText, 0, 3));
+                    }
+                }
+
+                // Zero-pad day numbers to ensure consistent format
+                $startDay = str_pad($match[1], 2, '0', STR_PAD_LEFT);
+                $endDay = str_pad($match[2], 2, '0', STR_PAD_LEFT);
+
+                $validityStr = $startDay . '-' . $endDay . '  ' . $monthCode . ' ' . $match[4];
+                $dayRange = intval($match[2]) - intval($match[1]) + 1;
                 $foundValidities[] = [
                     'string' => $validityStr,
                     'days' => $dayRange,
@@ -4908,10 +4954,52 @@ class RateExtractionService
             // Pattern 2: Cross-month range (e.g., "ValidityCross: 15 Jan - 03 Feb 2026")
             if (preg_match('/^ValidityCross:\s*(\d{1,2})\s+([A-Za-z]+)\s*-\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/i', $line, $match)) {
                 $startDay = intval($match[1]);
-                $startMonth = $monthToNum[strtolower($match[2])];
+                $startMonthText = strtolower(trim($match[2]));
                 $endDay = intval($match[3]);
-                $endMonth = $monthToNum[strtolower($match[4])];
+                $endMonthText = strtolower(trim($match[4]));
                 $year = $match[5];
+
+                // Normalize start month with fallback logic (same as Pattern 1)
+                $startMonthCode = null;
+                if (isset($monthMap[$startMonthText])) {
+                    $startMonthCode = $monthMap[$startMonthText];
+                } else {
+                    // Fallback: Try partial match
+                    $firstThreeChars = substr($startMonthText, 0, 3);
+                    foreach ($monthMap as $key => $value) {
+                        if (strpos($key, $firstThreeChars) === 0) {
+                            $startMonthCode = $value;
+                            break;
+                        }
+                    }
+                    // Ultimate fallback: Uppercase first 3 letters
+                    if ($startMonthCode === null) {
+                        $startMonthCode = strtoupper(substr($startMonthText, 0, 3));
+                    }
+                }
+
+                // Normalize end month with fallback logic
+                $endMonthCode = null;
+                if (isset($monthMap[$endMonthText])) {
+                    $endMonthCode = $monthMap[$endMonthText];
+                } else {
+                    // Fallback: Try partial match
+                    $firstThreeChars = substr($endMonthText, 0, 3);
+                    foreach ($monthMap as $key => $value) {
+                        if (strpos($key, $firstThreeChars) === 0) {
+                            $endMonthCode = $value;
+                            break;
+                        }
+                    }
+                    // Ultimate fallback: Uppercase first 3 letters
+                    if ($endMonthCode === null) {
+                        $endMonthCode = strtoupper(substr($endMonthText, 0, 3));
+                    }
+                }
+
+                // Get month numbers for day range calculation
+                $startMonth = isset($monthToNum[$startMonthText]) ? $monthToNum[$startMonthText] : 1;
+                $endMonth = isset($monthToNum[$endMonthText]) ? $monthToNum[$endMonthText] : 1;
 
                 // Calculate day range across months
                 $startMonthDays = cal_days_in_month(CAL_GREGORIAN, $startMonth, $year);
@@ -4920,9 +5008,9 @@ class RateExtractionService
                 // Format: "15 JAN - 03 FEB 2026"
                 $validityStr = sprintf('%02d %s - %02d %s %s',
                     $startDay,
-                    $monthTo3Letter[$startMonth],
+                    $startMonthCode,
                     $endDay,
-                    $monthTo3Letter[$endMonth],
+                    $endMonthCode,
                     $year
                 );
 
