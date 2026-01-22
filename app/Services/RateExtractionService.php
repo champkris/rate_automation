@@ -4844,8 +4844,6 @@ class RateExtractionService
     {
         $leftRates = [];   // New Zealand ports
         $rightRates = [];  // Australia ports
-        $lastRemarkLeft = '';   // For merged cells on left side (NZ)
-        $lastRemarkRight = '';  // For merged cells on right side (AU)
 
         // Parse POL mappings from prepended line (added by extractFromPdf)
         $polMappings = [
@@ -5162,13 +5160,6 @@ class RateExtractionService
                 $rate40_1 = str_replace(',', '', $rate40_1);
                 $rate40HQ1 = str_replace(',', '', $rate40HQ1);
 
-                // Handle merged remark cells
-                if (empty($remark1) && !empty($lastRemarkLeft)) {
-                    $remark1 = $lastRemarkLeft;
-                } elseif (!empty($remark1)) {
-                    $lastRemarkLeft = $remark1;
-                }
-
                 // Determine POL and validity based on which side this is
                 if ($leftIsAustralia) {
                     // Left side is Australia - use dynamic POL mapping
@@ -5220,13 +5211,6 @@ class RateExtractionService
                     $rate40_2 = str_replace(',', '', $rate40_2);
                     $rate40HQ2 = str_replace(',', '', $rate40HQ2);
 
-                    // Handle merged remark cells
-                    if (empty($remark2) && !empty($lastRemarkRight)) {
-                        $remark2 = $lastRemarkRight;
-                    } elseif (!empty($remark2)) {
-                        $lastRemarkRight = $remark2;
-                    }
-
                     // Determine POL and validity based on which side this is
                     if ($rightIsAustralia) {
                         // Right side is Australia - use dynamic POL mapping
@@ -5275,6 +5259,38 @@ class RateExtractionService
         foreach ($rates as &$rate) {
             $rate['_region'] = 'Oceania(Australia)';
             $rate['_validity_for_filename'] = $filenameValidity;
+        }
+        unset($rate);  // Break reference
+
+        // ============================================================================
+        // MERGED CELL HANDLING: Domain-Specific Pattern Detection
+        // ============================================================================
+        // Background: OCR cannot detect merged cells visually. Instead, we use
+        // business logic: "No accept new NZ shipment" is a region-wide restriction
+        // that applies to ALL NZ ports when present.
+        // ============================================================================
+
+        // Step 1: Scan all remarks to find NZ region-wide restriction
+        $nzRegionRemark = '';
+        foreach ($rates as $rate) {
+            if (!empty($rate['REMARK']) && preg_match('/No accept new NZ shipment/i', $rate['REMARK'])) {
+                $nzRegionRemark = $rate['REMARK'];
+                break;  // Found it, stop scanning
+            }
+        }
+
+        // Step 2: Apply NZ restriction to blank NZ ports only
+        if (!empty($nzRegionRemark)) {
+            // List of NZ port names
+            $nzPortNames = ['Auckland', 'Lyttelton', 'Wellington', 'Napier', 'Tauranga'];
+
+            foreach ($rates as &$rate) {
+                // Check if: (1) remark is blank, (2) port is NZ (POD is in NZ port list)
+                if (empty($rate['REMARK']) && in_array($rate['POD'], $nzPortNames)) {
+                    $rate['REMARK'] = $nzRegionRemark;
+                }
+            }
+            unset($rate);  // Break reference to avoid side effects
         }
 
         return $rates;
