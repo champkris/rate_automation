@@ -308,10 +308,21 @@ class RateExtractionService
                 }
 
                 // Also add Validity information for regions with multiple validities (like Oceania)
-                // Extract all "Validity : DD-DD Month YYYY" patterns
-                if (preg_match_all('/Validity\s*:\s*\n?\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $fullText, $validityMatches, PREG_SET_ORDER)) {
+                // Extract all "Validity : DD-DD Month YYYY" patterns (including cross-month ranges)
+
+                // Pattern 1: Same month range (e.g., "04-14 January 2026")
+                // Use [\s\n]* to handle any whitespace including newlines between colon and date
+                if (preg_match_all('/Validity\s*:[\s\n]*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $fullText, $validityMatches, PREG_SET_ORDER)) {
                     foreach ($validityMatches as $validityMatch) {
                         $validityLine = "Validity: " . $validityMatch[1] . '-' . $validityMatch[2] . ' ' . $validityMatch[3] . ' ' . $validityMatch[4];
+                        array_unshift($lines, $validityLine);
+                    }
+                }
+
+                // Pattern 2: Cross-month range (e.g., "15 Jan - 03 Feb 2026")
+                if (preg_match_all('/Validity\s*:\s*\n?\s*(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*-\s*(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})/i', $fullText, $crossMonthMatches, PREG_SET_ORDER)) {
+                    foreach ($crossMonthMatches as $match) {
+                        $validityLine = "ValidityCross: " . $match[1] . ' ' . $match[2] . ' - ' . $match[3] . ' ' . $match[4] . ' ' . $match[5];
                         array_unshift($lines, $validityLine);
                     }
                 }
@@ -4732,38 +4743,160 @@ class RateExtractionService
      */
     protected function parsePilOceaniaTable(array $lines, string $validity): array
     {
-        $rates = [];
+        $leftRates = [];   // New Zealand ports
+        $rightRates = [];  // Australia ports
         $lastRemarkLeft = '';   // For merged cells on left side (NZ)
         $lastRemarkRight = '';  // For merged cells on right side (AU)
 
         // Parse validity from prepended validity lines (added by extractFromPdf)
         $validityAustralia = '';
         $validityNZ = '';
+        $validityAustraliaDays = 0;
+        $validityNZDays = 0;
+
+        // Month to number mapping for date calculations
+        $monthToNum = [
+            'jan' => 1, 'january' => 1,
+            'feb' => 2, 'february' => 2,
+            'mar' => 3, 'march' => 3,
+            'apr' => 4, 'april' => 4,
+            'may' => 5,
+            'jun' => 6, 'june' => 6,
+            'jul' => 7, 'july' => 7,
+            'aug' => 8, 'august' => 8,
+            'sep' => 9, 'september' => 9,
+            'oct' => 10, 'october' => 10,
+            'nov' => 11, 'november' => 11,
+            'dec' => 12, 'december' => 12,
+        ];
+
+        // Month to 3-letter code
+        $monthTo3Letter = [
+            1 => 'JAN', 2 => 'FEB', 3 => 'MAR', 4 => 'APR', 5 => 'MAY', 6 => 'JUN',
+            7 => 'JUL', 8 => 'AUG', 9 => 'SEP', 10 => 'OCT', 11 => 'NOV', 12 => 'DEC',
+        ];
 
         // Look for Validity lines added by extractFromPdf
-        foreach ($lines as $line) {
-            if (preg_match('/^Validity:\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $line, $match)) {
-                // Convert month to 3-letter code
-                $monthMap = [
-                    'january' => 'JAN', 'february' => 'FEB', 'march' => 'MAR',
-                    'april' => 'APR', 'may' => 'MAY', 'june' => 'JUN',
-                    'july' => 'JUL', 'august' => 'AUG', 'september' => 'SEP',
-                    'october' => 'OCT', 'november' => 'NOV', 'december' => 'DEC',
-                ];
-                $monthCode = $monthMap[strtolower($match[3])];
-                $validityStr = $match[1] . '-' . $match[2] . '  ' . $monthCode . ' ' . $match[4];
+        $foundValidities = [];
 
-                if ($match[1] === '04') {
-                    $validityAustralia = $validityStr;
-                } elseif ($match[1] === '01') {
-                    $validityNZ = $validityStr;
-                }
+        foreach ($lines as $line) {
+            // Pattern 1: Same month range (e.g., "Validity: 04-14 January 2026")
+            if (preg_match('/^Validity:\s*(\d{2})-(\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $line, $match)) {
+                $monthCode = $monthTo3Letter[$monthToNum[strtolower($match[3])]];
+                $validityStr = $match[1] . '-' . $match[2] . '  ' . $monthCode . ' ' . $match[4];
+                $dayRange = intval($match[2]) - intval($match[1]);
+                $foundValidities[] = [
+                    'string' => $validityStr,
+                    'days' => $dayRange,
+                    'cross_month' => false,
+                ];
+            }
+
+            // Pattern 2: Cross-month range (e.g., "ValidityCross: 15 Jan - 03 Feb 2026")
+            if (preg_match('/^ValidityCross:\s*(\d{1,2})\s+([A-Za-z]+)\s*-\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/i', $line, $match)) {
+                $startDay = intval($match[1]);
+                $startMonth = $monthToNum[strtolower($match[2])];
+                $endDay = intval($match[3]);
+                $endMonth = $monthToNum[strtolower($match[4])];
+                $year = $match[5];
+
+                // Calculate day range across months
+                $startMonthDays = cal_days_in_month(CAL_GREGORIAN, $startMonth, $year);
+                $dayRange = ($startMonthDays - $startDay + 1) + $endDay;
+
+                // Format: "15 JAN - 03 FEB 2026"
+                $validityStr = sprintf('%02d %s - %02d %s %s',
+                    $startDay,
+                    $monthTo3Letter[$startMonth],
+                    $endDay,
+                    $monthTo3Letter[$endMonth],
+                    $year
+                );
+
+                $foundValidities[] = [
+                    'string' => $validityStr,
+                    'days' => $dayRange,
+                    'cross_month' => true,
+                ];
             }
         }
 
+        // Assign validities based on found patterns
+        if (count($foundValidities) >= 2) {
+            // Check if we have a cross-month validity
+            $hasCrossMonth = false;
+            foreach ($foundValidities as $v) {
+                if ($v['cross_month']) {
+                    $hasCrossMonth = true;
+                    $validityAustralia = $v['string'];
+                    $validityAustraliaDays = $v['days'];
+                }
+            }
+
+            if ($hasCrossMonth) {
+                // Cross-month goes to Australia, other goes to NZ
+                foreach ($foundValidities as $v) {
+                    if (!$v['cross_month']) {
+                        $validityNZ = $v['string'];
+                        $validityNZDays = $v['days'];
+                        break;
+                    }
+                }
+            } else {
+                // Both are same-month - shorter range goes to Australia
+                usort($foundValidities, function($a, $b) { return $a['days'] - $b['days']; });
+                $validityAustralia = $foundValidities[0]['string'];
+                $validityAustraliaDays = $foundValidities[0]['days'];
+                $validityNZ = $foundValidities[1]['string'];
+                $validityNZDays = $foundValidities[1]['days'];
+            }
+        } elseif (count($foundValidities) == 1) {
+            // Only one validity found - use for both (shouldn't happen in Oceania)
+            $v = $foundValidities[0];
+            $validityAustralia = $v['string'];
+            $validityAustraliaDays = $v['days'];
+            $validityNZ = $v['string'];
+            $validityNZDays = $v['days'];
+        }
+
         // If we didn't find specific validities, use the provided one
-        if (empty($validityAustralia)) $validityAustralia = $validity;
-        if (empty($validityNZ)) $validityNZ = $validity;
+        if (empty($validityAustralia)) {
+            $validityAustralia = $validity;
+            $validityAustraliaDays = 14; // Default assumption
+        }
+        if (empty($validityNZ)) {
+            $validityNZ = $validity;
+            $validityNZDays = 14; // Default assumption
+        }
+
+        // Detect which side is which by checking first data row
+        // PDF 1: Left=NZ (Auckland), Right=AU (Brisbane)
+        // PDF 2: Left=AU (Brisbane), Right=NZ (Auckland)
+        $leftIsAustralia = false;
+        $rightIsAustralia = false;
+
+        foreach ($lines as $line) {
+            if (preg_match('/^Row \d+: (.+)$/', $line, $matches)) {
+                $cells = explode(' | ', $matches[1]);
+                $firstPort = trim($cells[0] ?? '');
+
+                // Skip headers
+                if (preg_match('/(PORTs|CODE|20\'|40\')/i', $firstPort)) {
+                    continue;
+                }
+
+                // Check if first port is Australian or NZ
+                if (preg_match('/^(Brisbane|Sydney|Melbourne|Fremantle|Adelaide)$/i', $firstPort)) {
+                    $leftIsAustralia = true;
+                    $rightIsAustralia = false;
+                    break;
+                } elseif (preg_match('/^(Auckland|Lyttelton|Wellington|Napier|Tauranga)$/i', $firstPort)) {
+                    $leftIsAustralia = false;
+                    $rightIsAustralia = true;
+                    break;
+                }
+            }
+        }
 
         foreach ($lines as $lineIndex => $line) {
             if (!preg_match('/^Row \d+: (.+)$/', $line, $matches)) continue;
@@ -4781,10 +4914,10 @@ class RateExtractionService
             }
 
             // Oceania has side-by-side layout BUT with dynamic column shifting:
-            // Left side (NZ): cells 0-7 (or 0-8 if remark exists) → PORT | CODE | 20' | 40' | 40HC | T/T | T/S | F/T | [REMARK]
-            // Right side (AU): starts at cell 8 or 9 depending on whether left has remark
+            // Can be: Left=NZ, Right=AU OR Left=AU, Right=NZ (detected above)
+            // Each side: PORT | CODE | 20' | 40' | 40HC | T/T | T/S | F/T | [REMARK]
 
-            // Process LEFT side (New Zealand)
+            // Process LEFT side
             $pod1 = trim($cells[0] ?? '');
             $code1 = trim($cells[1] ?? '');
             $rate20_1 = trim($cells[2] ?? '');
@@ -4835,17 +4968,36 @@ class RateExtractionService
                     $lastRemarkLeft = $remark1;
                 }
 
-                $rates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod1, $rate20_1, $rate40_1, [
-                    '40 HQ' => $rate40HQ1,
-                    'T/T' => !empty($tt1) ? $tt1 : '',
-                    'T/S' => !empty($ts1) ? $ts1 : '',
-                    'FREE TIME' => !empty($freeTime1) ? $freeTime1 : '',
-                    'VALIDITY' => $validityNZ,
-                    'REMARK' => $remark1,
-                ]);
+                // Determine POL and validity based on which side this is
+                if ($leftIsAustralia) {
+                    // Left side is Australia
+                    $pol1 = 'BKK/LKR/LCH';  // Default
+                    if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod1)) {
+                        $pol1 = 'LKR/LCH';
+                    }
+                    $validity1 = $validityAustralia;
+                    $rightRates[] = $this->createRateEntry('PIL', $pol1, $pod1, $rate20_1, $rate40_1, [
+                        '40 HQ' => $rate40HQ1,
+                        'T/T' => !empty($tt1) ? $tt1 : '',
+                        'T/S' => !empty($ts1) ? $ts1 : '',
+                        'FREE TIME' => !empty($freeTime1) ? $freeTime1 : '',
+                        'VALIDITY' => $validity1,
+                        'REMARK' => $remark1,
+                    ]);
+                } else {
+                    // Left side is New Zealand
+                    $leftRates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod1, $rate20_1, $rate40_1, [
+                        '40 HQ' => $rate40HQ1,
+                        'T/T' => !empty($tt1) ? $tt1 : '',
+                        'T/S' => !empty($ts1) ? $ts1 : '',
+                        'FREE TIME' => !empty($freeTime1) ? $freeTime1 : '',
+                        'VALIDITY' => $validityNZ,
+                        'REMARK' => $remark1,
+                    ]);
+                }
             }
 
-            // Process RIGHT side (Australia)
+            // Process RIGHT side
             // Right side starts at $rightStartIndex (either 8 or 9)
             if (count($cells) >= $rightStartIndex + 8) {  // Need at least 8 cells for complete record
                 $pod2 = trim($cells[$rightStartIndex] ?? '');
@@ -4869,14 +5021,6 @@ class RateExtractionService
                     $rate40_2 = str_replace(',', '', $rate40_2);
                     $rate40HQ2 = str_replace(',', '', $rate40HQ2);
 
-                    // Determine POL for Australian ports based on port name
-                    // Brisbane, Sydney, Melbourne use LKR/LCH
-                    // Fremantle, Adelaide use BKK/LKR/LCH
-                    $pol2 = 'BKK/LKR/LCH';  // Default
-                    if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod2)) {
-                        $pol2 = 'LKR/LCH';
-                    }
-
                     // Handle merged remark cells
                     if (empty($remark2) && !empty($lastRemarkRight)) {
                         $remark2 = $lastRemarkRight;
@@ -4884,21 +5028,56 @@ class RateExtractionService
                         $lastRemarkRight = $remark2;
                     }
 
-                    $rates[] = $this->createRateEntry('PIL', $pol2, $pod2, $rate20_2, $rate40_2, [
-                        '40 HQ' => $rate40HQ2,
-                        'T/T' => !empty($tt2) ? $tt2 : '',
-                        'T/S' => !empty($ts2) ? $ts2 : '',
-                        'FREE TIME' => !empty($freeTime2) ? $freeTime2 : '',
-                        'VALIDITY' => $validityAustralia,
-                        'REMARK' => $remark2,
-                    ]);
+                    // Determine POL and validity based on which side this is
+                    if ($rightIsAustralia) {
+                        // Right side is Australia
+                        $pol2 = 'BKK/LKR/LCH';  // Default
+                        if (preg_match('/\b(Brisbane|Sydney|Melbourne)\b/i', $pod2)) {
+                            $pol2 = 'LKR/LCH';
+                        }
+                        $validity2 = $validityAustralia;
+                        $rightRates[] = $this->createRateEntry('PIL', $pol2, $pod2, $rate20_2, $rate40_2, [
+                            '40 HQ' => $rate40HQ2,
+                            'T/T' => !empty($tt2) ? $tt2 : '',
+                            'T/S' => !empty($ts2) ? $ts2 : '',
+                            'FREE TIME' => !empty($freeTime2) ? $freeTime2 : '',
+                            'VALIDITY' => $validity2,
+                            'REMARK' => $remark2,
+                        ]);
+                    } else {
+                        // Right side is New Zealand
+                        $leftRates[] = $this->createRateEntry('PIL', 'BKK/LKR/LCH', $pod2, $rate20_2, $rate40_2, [
+                            '40 HQ' => $rate40HQ2,
+                            'T/T' => !empty($tt2) ? $tt2 : '',
+                            'T/S' => !empty($ts2) ? $ts2 : '',
+                            'FREE TIME' => !empty($freeTime2) ? $freeTime2 : '',
+                            'VALIDITY' => $validityNZ,
+                            'REMARK' => $remark2,
+                        ]);
+                    }
                 }
             }
+        }
+
+        // Combine arrays: ALL Australia ports first, then ALL NZ ports
+        // rightRates = Australia ports, leftRates = NZ ports
+        $rates = array_merge($rightRates, $leftRates);
+
+        // Determine which validity has shorter date range for filename
+        $filenameValidity = $validity;
+        if ($validityAustraliaDays > 0 && $validityNZDays > 0) {
+            // Use the one with shorter range
+            $filenameValidity = ($validityAustraliaDays <= $validityNZDays) ? $validityAustralia : $validityNZ;
+        } elseif (!empty($validityAustralia)) {
+            $filenameValidity = $validityAustralia;
+        } elseif (!empty($validityNZ)) {
+            $filenameValidity = $validityNZ;
         }
 
         // Add region metadata for filename generation
         foreach ($rates as &$rate) {
             $rate['_region'] = 'Oceania(Australia)';
+            $rate['_validity_for_filename'] = $filenameValidity;
         }
 
         return $rates;

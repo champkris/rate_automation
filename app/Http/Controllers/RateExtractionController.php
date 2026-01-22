@@ -297,6 +297,14 @@ class RateExtractionController extends Controller
      */
     protected function getValidityPeriod(array $rates): string
     {
+        // First check for _validity_for_filename metadata (for documents with multiple validities)
+        foreach ($rates as $rate) {
+            if (isset($rate['_validity_for_filename']) && !empty($rate['_validity_for_filename'])) {
+                return $rate['_validity_for_filename'];
+            }
+        }
+
+        // Otherwise use the first VALIDITY found
         foreach ($rates as $rate) {
             $validity = trim($rate['VALIDITY'] ?? '');
             if (!empty($validity)) {
