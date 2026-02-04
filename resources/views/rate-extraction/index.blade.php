@@ -161,8 +161,11 @@
         // Global DataTransfer for cumulative file accumulation
         let accumulatedFiles = new DataTransfer();
 
-        // Click to upload
-        dropZone.addEventListener('click', () => fileInput.click());
+        // Click to upload (but not when clicking delete/clear buttons)
+        dropZone.addEventListener('click', (e) => {
+            if (e.target.closest('button')) return;
+            fileInput.click();
+        });
 
         // Drag and drop
         dropZone.addEventListener('dragover', (e) => {

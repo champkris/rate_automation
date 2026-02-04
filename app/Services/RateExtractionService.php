@@ -267,7 +267,7 @@ class RateExtractionService
             }
 
             // For PIL carrier: add Trade field from JSON or filename to help region detection
-            if ($pattern === 'pil' && file_exists($jsonFile)) {
+            if (str_starts_with($pattern, 'pil') && file_exists($jsonFile)) {
                 $jsonContent = file_get_contents($jsonFile);
 
                 // Try to extract Trade field from JSON
@@ -331,7 +331,7 @@ class RateExtractionService
             }
 
             // For PIL carrier: add Trade field from OCR result to help region detection
-            if ($pattern === 'pil') {
+            if (str_starts_with($pattern, 'pil')) {
                 $fullText = $azureOcr->extractFullTextFromResult($azureResult);
                 if (preg_match('/Trade:\s*([^\n]+)/i', $fullText, $matches)) {
                     // Prepend Trade field as first line for region detection
