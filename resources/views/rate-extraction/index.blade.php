@@ -36,11 +36,11 @@
 
                     <!-- File Upload -->
                     <div class="mb-6">
-                        <label class="block text-gray-700 text-sm font-bold mb-2" for="rate_file">
-                            Rate Card File
+                        <label class="block text-gray-700 text-sm font-bold mb-2" for="rate_files">
+                            Rate Card Files (Max 15 files)
                         </label>
                         <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors cursor-pointer" id="dropZone">
-                            <input type="file" name="rate_file" id="rate_file" accept=".xlsx,.xls,.csv,.pdf" class="hidden" required>
+                            <input type="file" name="rate_files[]" id="rate_files" accept=".xlsx,.xls,.csv,.pdf" class="hidden" multiple required>
                             <div id="fileInfo">
                                 <svg class="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
                                     <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
@@ -48,17 +48,20 @@
                                 <p class="mt-2 text-sm text-gray-600">
                                     <span class="font-medium text-blue-600 hover:text-blue-500">Click to upload</span> or drag and drop
                                 </p>
-                                <p class="mt-1 text-xs text-gray-500">Excel (.xlsx, .xls), CSV, or PDF files (max 10MB)</p>
+                                <p class="mt-1 text-xs text-gray-500">Excel (.xlsx, .xls), CSV, or PDF files (max 10MB each, max 15 files)</p>
                             </div>
-                            <div id="selectedFile" class="hidden">
+                            <div id="selectedFiles" class="hidden">
                                 <svg class="mx-auto h-12 w-12 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                                 </svg>
-                                <p class="mt-2 text-sm font-medium text-gray-900" id="fileName"></p>
-                                <p class="text-xs text-gray-500" id="fileSize"></p>
+                                <p class="mt-2 text-sm font-medium text-gray-900" id="fileCount"></p>
+                                <div id="fileList" class="mt-2 text-xs text-left max-h-40 overflow-y-auto"></div>
                             </div>
                         </div>
-                        @error('rate_file')
+                        @error('rate_files')
+                        <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                        @enderror
+                        @error('rate_files.*')
                         <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
                         @enderror
                     </div>
@@ -87,6 +90,16 @@
                         <input type="text" name="validity" id="validity" placeholder="e.g., DEC 2025 or 01-31 Dec 2025"
                                class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
                         <p class="text-xs text-gray-500 mt-1">Leave empty to use current month or extract from file</p>
+                    </div>
+
+                    <!-- Progress Bar (hidden initially) -->
+                    <div id="progressContainer" class="hidden mb-6">
+                        <div class="bg-gray-200 rounded-full h-8 overflow-hidden">
+                            <div id="progressBar" class="bg-blue-600 h-8 transition-all duration-300 flex items-center justify-center" style="width: 0%">
+                                <span id="progressText" class="text-white font-bold text-sm"></span>
+                            </div>
+                        </div>
+                        <p class="text-center text-sm text-gray-600 mt-2">Processing your files... Please wait</p>
                     </div>
 
                     <!-- Submit Button -->
@@ -135,11 +148,11 @@
 
     <script>
         const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('rate_file');
+        const fileInput = document.getElementById('rate_files');
         const fileInfo = document.getElementById('fileInfo');
-        const selectedFile = document.getElementById('selectedFile');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
+        const selectedFiles = document.getElementById('selectedFiles');
+        const fileCount = document.getElementById('fileCount');
+        const fileList = document.getElementById('fileList');
         const uploadForm = document.getElementById('uploadForm');
         const submitBtn = document.getElementById('submitBtn');
         const btnText = document.getElementById('btnText');
@@ -172,15 +185,64 @@
         fileInput.addEventListener('change', updateFileDisplay);
 
         function updateFileDisplay() {
-            if (fileInput.files.length > 0) {
-                const file = fileInput.files[0];
-                fileName.textContent = file.name;
-                fileSize.textContent = formatFileSize(file.size);
+            const files = fileInput.files;
+
+            if (files.length > 0) {
+                // Validate max 15 files
+                if (files.length > 15) {
+                    alert('Maximum 15 files allowed. Please select fewer files.');
+                    fileInput.value = '';
+                    fileInfo.classList.remove('hidden');
+                    selectedFiles.classList.add('hidden');
+                    return;
+                }
+
+                // Count file types for progress estimation
+                let pdfCount = 0;
+                let excelCount = 0;
+                let totalSize = 0;
+
+                // Build file list HTML
+                let listHtml = '<div class="space-y-1">';
+
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+                    const ext = file.name.split('.').pop().toLowerCase();
+
+                    // Count by type
+                    if (ext === 'pdf') {
+                        pdfCount++;
+                    } else if (['xlsx', 'xls', 'csv'].includes(ext)) {
+                        excelCount++;
+                    }
+
+                    totalSize += file.size;
+
+                    // Add to list
+                    const icon = ext === 'pdf' ? '📄' : '📊';
+                    listHtml += `<div class="flex items-center justify-between px-2 py-1 bg-gray-50 rounded">
+                        <span class="text-gray-700">${icon} ${file.name}</span>
+                        <span class="text-gray-500">${formatFileSize(file.size)}</span>
+                    </div>`;
+                }
+
+                listHtml += '</div>';
+
+                // Update display
+                fileCount.textContent = `${files.length} file${files.length > 1 ? 's' : ''} selected (${pdfCount} PDF, ${excelCount} Excel) - Total: ${formatFileSize(totalSize)}`;
+                fileList.innerHTML = listHtml;
+
                 fileInfo.classList.add('hidden');
-                selectedFile.classList.remove('hidden');
+                selectedFiles.classList.remove('hidden');
+
+                // Store file counts in form data for progress calculation
+                sessionStorage.setItem('fileUploadCounts', JSON.stringify({
+                    pdfCount: pdfCount,
+                    excelCount: excelCount
+                }));
             } else {
                 fileInfo.classList.remove('hidden');
-                selectedFile.classList.add('hidden');
+                selectedFiles.classList.add('hidden');
             }
         }
 
@@ -192,11 +254,57 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // Form submission
-        uploadForm.addEventListener('submit', function() {
+        // Form submission with progress bar
+        let progressInterval;
+
+        uploadForm.addEventListener('submit', function(e) {
+            // Validate that files are selected
+            if (!fileInput.files || fileInput.files.length === 0) {
+                alert('Please select at least one file to upload.');
+                e.preventDefault();
+                return false;
+            }
+
+            // Get file counts from sessionStorage
+            const counts = JSON.parse(sessionStorage.getItem('fileUploadCounts') || '{"pdfCount":0,"excelCount":0}');
+            const pdfCount = counts.pdfCount || 0;
+            const excelCount = counts.excelCount || 0;
+
+            // Calculate total estimated time (PDF=9s, Excel=4s)
+            const totalTime = (pdfCount * 9 + excelCount * 4) * 1000; // milliseconds
+
+            // Disable submit button and show loading
             submitBtn.disabled = true;
             btnText.classList.add('hidden');
             btnLoading.classList.remove('hidden');
+
+            // Show progress bar
+            const progressContainer = document.getElementById('progressContainer');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+
+            progressContainer.classList.remove('hidden');
+
+            // Animate progress bar to 95% over estimated time
+            let progress = 0;
+            const maxProgress = 95;
+            const updateInterval = 100; // Update every 100ms
+            const increment = (maxProgress / totalTime) * updateInterval;
+
+            progressInterval = setInterval(() => {
+                progress += increment;
+
+                if (progress >= maxProgress) {
+                    progress = maxProgress;
+                    clearInterval(progressInterval);
+                }
+
+                progressBar.style.width = Math.floor(progress) + '%';
+                progressText.textContent = Math.floor(progress) + '%';
+            }, updateInterval);
+
+            // Allow form to submit normally
+            return true;
         });
     </script>
 </body>

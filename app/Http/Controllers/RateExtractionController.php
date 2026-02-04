@@ -22,6 +22,9 @@ class RateExtractionController extends Controller
      */
     public function index()
     {
+        // Clean up old temp files (older than 30 minutes)
+        $this->cleanupOldTempFiles();
+
         $patterns = $this->extractionService->getAvailablePatterns();
         return view('rate-extraction.index', compact('patterns'));
     }
@@ -31,53 +34,195 @@ class RateExtractionController extends Controller
      */
     public function process(Request $request)
     {
+        // Increase execution time limit for batch processing (5 minutes)
+        set_time_limit(300);
+
         $request->validate([
-            'rate_file' => 'required|file|mimes:xlsx,xls,csv,pdf|max:10240',
+            'rate_files' => 'required|array|max:15',
+            'rate_files.*' => 'file|mimes:xlsx,xls,csv,pdf|max:10240',
             'pattern' => 'required|string',
             'validity' => 'nullable|string',
         ]);
 
-        $file = $request->file('rate_file');
+        $files = $request->file('rate_files');
         $pattern = $request->input('pattern');
         $validity = $request->input('validity') ?? '';
+        $timestamp = time();
+        $batchFiles = [];
 
-        // Store the file temporarily - sanitize filename to remove spaces and special characters
-        $originalName = $file->getClientOriginalName();
-        $extension = $file->getClientOriginalExtension();
-        // Keep only safe ASCII characters and preserve extension
-        $sanitizedName = preg_replace('/[^a-zA-Z0-9._-]/', '_', pathinfo($originalName, PATHINFO_FILENAME));
-        $filename = time() . '_' . $sanitizedName . '.' . $extension;
+        // Ensure extracted directory exists
+        $extractedDir = storage_path('app/extracted');
+        if (!is_dir($extractedDir)) {
+            mkdir($extractedDir, 0755, true);
+        }
 
-        // Use Laravel's storage system which handles Unicode paths better
-        try {
-            // Store using Laravel's Storage facade (handles Unicode better)
-            $storedPath = $file->storeAs('temp_uploads', $filename, 'local');
+        // Process each file
+        foreach ($files as $index => $file) {
+            // Store the file temporarily - sanitize filename to remove spaces and special characters
+            $originalName = $file->getClientOriginalName();
+            $extension = $file->getClientOriginalExtension();
+            // Keep only safe ASCII characters and preserve extension
+            $sanitizedName = preg_replace('/[^a-zA-Z0-9._-]/', '_', pathinfo($originalName, PATHINFO_FILENAME));
 
-            // Get the real path - Storage::path() handles the local disk properly
-            $fullPath = Storage::disk('local')->path($storedPath);
+            // Add loop counter for uniqueness: timestamp_index_name.extension
+            $filename = $timestamp . '_' . $index . '_' . $sanitizedName . '.' . $extension;
 
-            // Verify file was stored
-            if (!Storage::disk('local')->exists($storedPath)) {
-                \Log::error('File upload failed: File not found after storage - ' . $storedPath);
-                return back()->with('error', 'Failed to upload file. Please try again.');
+            // Use Laravel's storage system which handles Unicode paths better
+            try {
+                // Store using Laravel's Storage facade (handles Unicode better)
+                $storedPath = $file->storeAs('temp_uploads', $filename, 'local');
+
+                // Get the real path - Storage::path() handles the local disk properly
+                $fullPath = Storage::disk('local')->path($storedPath);
+
+                // Verify file was stored
+                if (!Storage::disk('local')->exists($storedPath)) {
+                    \Log::error('File upload failed: File not found after storage - ' . $storedPath);
+
+                    $batchFiles[] = [
+                        'original_filename' => $originalName,
+                        'temp_filename' => $filename,
+                        'status' => 'failed',
+                        'error' => 'Failed to upload file'
+                    ];
+                    continue;
+                }
+
+                \Log::info('File uploaded successfully: ' . $fullPath);
+
+                // Extract rates using the selected pattern
+                $rates = $this->extractionService->extractRates($fullPath, $pattern, $validity);
+
+                if (empty($rates)) {
+                    $batchFiles[] = [
+                        'original_filename' => $originalName,
+                        'temp_filename' => $filename,
+                        'status' => 'failed',
+                        'error' => 'No rates could be extracted. Please check the file format or try manual pattern selection.'
+                    ];
+                    continue;
+                }
+
+                // Generate output Excel file
+                $outputFilename = 'extracted_rates_' . $timestamp . '_' . $index . '.xlsx';
+                $outputPath = storage_path('app/extracted/' . $outputFilename);
+
+                $this->generateExcel($rates, $outputPath);
+
+                // Get carrier name from pattern or rates for download filename
+                $carrierName = $this->getCarrierNameFromPattern($pattern, $originalName, $rates);
+                $validityPeriod = $this->getValidityPeriod($rates);
+                $region = $this->getRegionFromRates($rates);
+                $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod, $region);
+
+                // Add to batch results
+                $batchFiles[] = [
+                    'original_filename' => $originalName,
+                    'temp_filename' => $filename,
+                    'output_filename' => $outputFilename,
+                    'download_name' => $downloadFilename,
+                    'carrier' => $carrierName,
+                    'validity' => $validityPeriod,
+                    'region' => $region,
+                    'rate_count' => count($rates),
+                    'status' => 'success'
+                ];
+
+                \Log::info('Successfully processed file: ' . $originalName);
+
+            } catch (\Exception $e) {
+                \Log::error('Error processing file ' . $originalName . ': ' . $e->getMessage());
+
+                // Mark as failed
+                $batchFiles[] = [
+                    'original_filename' => $originalName,
+                    'temp_filename' => $filename,
+                    'status' => 'failed',
+                    'error' => $e->getMessage()
+                ];
             }
 
-            \Log::info('File uploaded successfully: ' . $fullPath);
-        } catch (\Exception $e) {
-            \Log::error('File upload exception: ' . $e->getMessage() . ' | Trace: ' . $e->getTraceAsString());
-            return back()->with('error', 'Failed to upload file: ' . $e->getMessage());
+            // DON'T delete temp file - keep for 30 minutes for re-processing
+        }
+
+        // Check if any files were processed
+        if (empty($batchFiles)) {
+            return back()->with('error', 'No files could be processed. Please try again.');
+        }
+
+        // Store batch results in session with timestamp for cleanup
+        session([
+            'batch_files' => $batchFiles,
+            'batch_timestamp' => $timestamp,
+            'batch_patterns' => $this->extractionService->getAvailablePatterns() // For re-process dropdown
+        ]);
+
+        return redirect()->route('rate-extraction.result');
+    }
+
+    /**
+     * Show extraction result
+     */
+    public function result()
+    {
+        $batchFiles = session('batch_files', []);
+
+        if (empty($batchFiles)) {
+            return redirect()->route('rate-extraction.index')
+                ->with('error', 'No extraction result found. Please upload files first.');
+        }
+
+        return view('rate-extraction.result', compact('batchFiles'));
+    }
+
+    /**
+     * Re-process a failed file with user-selected pattern
+     */
+    public function reprocess(Request $request)
+    {
+        $request->validate([
+            'filename' => 'required|string',
+            'pattern' => 'required|string',
+        ]);
+
+        $tempFilename = $request->input('filename');
+        $pattern = $request->input('pattern');
+        $validity = '';
+
+        // Get full path to temp file
+        $fullPath = Storage::disk('local')->path('temp_uploads/' . $tempFilename);
+
+        if (!file_exists($fullPath)) {
+            return back()->with('error', 'File not found. It may have been cleaned up. Please upload again.');
+        }
+
+        // Get batch files from session
+        $batchFiles = session('batch_files', []);
+        $batchTimestamp = session('batch_timestamp', time());
+
+        // Find the file in batch
+        $fileIndex = null;
+        foreach ($batchFiles as $index => $file) {
+            if ($file['temp_filename'] === $tempFilename) {
+                $fileIndex = $index;
+                break;
+            }
+        }
+
+        if ($fileIndex === null) {
+            return back()->with('error', 'File not found in batch results.');
         }
 
         try {
-            // Extract rates using the selected pattern
+            // Re-extract rates with user-selected pattern
             $rates = $this->extractionService->extractRates($fullPath, $pattern, $validity);
 
             if (empty($rates)) {
-                return back()->with('error', 'No rates could be extracted from the file. Please check the file format and selected pattern.');
+                return back()->with('error', 'Still could not extract rates with selected pattern. Please try another pattern.');
             }
 
             // Generate output Excel file
-            $outputFilename = 'extracted_rates_' . time() . '.xlsx';
+            $outputFilename = 'extracted_rates_' . $batchTimestamp . '_' . $fileIndex . '.xlsx';
             $outputPath = storage_path('app/extracted/' . $outputFilename);
 
             // Ensure directory exists
@@ -87,49 +232,36 @@ class RateExtractionController extends Controller
 
             $this->generateExcel($rates, $outputPath);
 
-            // Get carrier name from pattern or rates for download filename
-            // Use pattern name if specific (not auto), otherwise use carrier from rates
-            $carrierName = $this->getCarrierNameFromPattern($pattern, $originalName, $rates);
+            // Get carrier info
+            $originalFilename = $batchFiles[$fileIndex]['original_filename'];
+            $carrierName = $this->getCarrierNameFromPattern($pattern, $originalFilename, $rates);
             $validityPeriod = $this->getValidityPeriod($rates);
             $region = $this->getRegionFromRates($rates);
             $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod, $region);
 
-            // Store session data for download
-            session([
-                'extracted_file' => $outputFilename,
-                'extracted_count' => count($rates),
-                'carrier_summary' => $this->getCarrierSummary($rates),
-                'download_filename' => $downloadFilename,
-            ]);
+            // Update batch file status to success
+            $batchFiles[$fileIndex] = [
+                'original_filename' => $originalFilename,
+                'temp_filename' => $tempFilename,
+                'output_filename' => $outputFilename,
+                'download_name' => $downloadFilename,
+                'carrier' => $carrierName,
+                'validity' => $validityPeriod,
+                'region' => $region,
+                'rate_count' => count($rates),
+                'status' => 'success'
+            ];
 
-            // Clean up temp file
-            @unlink($fullPath);
+            // Update session
+            session(['batch_files' => $batchFiles]);
 
-            return redirect()->route('rate-extraction.result');
+            return redirect()->route('rate-extraction.result')
+                ->with('success', 'File re-processed successfully!');
 
         } catch (\Exception $e) {
-            // Clean up temp file on error
-            @unlink($fullPath);
-
-            return back()->with('error', 'Error processing file: ' . $e->getMessage());
+            \Log::error('Error re-processing file: ' . $e->getMessage());
+            return back()->with('error', 'Error re-processing file: ' . $e->getMessage());
         }
-    }
-
-    /**
-     * Show extraction result
-     */
-    public function result()
-    {
-        $filename = session('extracted_file');
-        $count = session('extracted_count', 0);
-        $carrierSummary = session('carrier_summary', []);
-
-        if (!$filename) {
-            return redirect()->route('rate-extraction.index')
-                ->with('error', 'No extraction result found. Please upload a file first.');
-        }
-
-        return view('rate-extraction.result', compact('filename', 'count', 'carrierSummary'));
     }
 
     /**
@@ -354,5 +486,40 @@ class RateExtractionController extends Controller
         }
 
         return strtoupper($cleanCarrier) . '_' . strtoupper($cleanValidity) . '.xlsx';
+    }
+
+    /**
+     * Clean up temp files older than 30 minutes
+     */
+    protected function cleanupOldTempFiles(): void
+    {
+        try {
+            $tempPath = Storage::disk('local')->path('temp_uploads');
+
+            if (!is_dir($tempPath)) {
+                return;
+            }
+
+            $now = time();
+            $maxAge = 30 * 60; // 30 minutes in seconds
+
+            $files = Storage::disk('local')->files('temp_uploads');
+
+            foreach ($files as $file) {
+                $fullPath = Storage::disk('local')->path($file);
+
+                // Check if file exists and is older than 30 minutes
+                if (file_exists($fullPath)) {
+                    $fileAge = $now - filemtime($fullPath);
+
+                    if ($fileAge > $maxAge) {
+                        @unlink($fullPath);
+                        \Log::info('Cleaned up old temp file: ' . $file . ' (age: ' . round($fileAge / 60, 1) . ' minutes)');
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            \Log::error('Error cleaning up temp files: ' . $e->getMessage());
+        }
     }
 }

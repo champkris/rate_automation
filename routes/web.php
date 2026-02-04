@@ -14,6 +14,7 @@ Route::get('/extract', [RateExtractionController::class, 'index'])->name('rate-e
 Route::post('/extract', [RateExtractionController::class, 'process'])->name('rate-extraction.process');
 Route::get('/extract/result', [RateExtractionController::class, 'result'])->name('rate-extraction.result');
 Route::get('/extract/download/{filename}', [RateExtractionController::class, 'download'])->name('rate-extraction.download');
+Route::post('/extract/reprocess', [RateExtractionController::class, 'reprocess'])->name('rate-extraction.reprocess');
 
 // Google OAuth routes for Gmail API
 Route::get('/auth/google', [GoogleAuthController::class, 'redirect'])->name('google.auth');
