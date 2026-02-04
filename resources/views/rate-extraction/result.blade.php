@@ -123,43 +123,6 @@
                 @endforeach
             </div>
 
-            <!-- Download All Section -->
-            @if($successCount > 0)
-            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
-                <div class="text-center">
-                    <button id="downloadAllBtn" onclick="downloadAll()" class="inline-flex items-center px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition-colors">
-                        <svg class="h-5 w-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                        </svg>
-                        📥 Download All Files ({{ $successCount }})
-                    </button>
-
-                    <!-- Fallback message (hidden initially) -->
-                    <div id="fallbackMessage" class="hidden mt-6">
-                        <div class="bg-orange-100 border border-orange-400 text-orange-700 px-6 py-4 rounded-lg">
-                            <p class="font-bold text-lg">Browser ไม่ support Download All</p>
-                            <p class="mt-1">รบกวนกด Download ทีละไฟล์นะครับ 👇</p>
-                        </div>
-                    </div>
-
-                    <!-- Individual downloads (hidden initially) -->
-                    <div id="individualDownloads" class="hidden mt-6 space-y-2">
-                        @foreach($batchFiles as $file)
-                            @if($file['status'] === 'success')
-                            <a href="{{ route('rate-extraction.download', $file['output_filename']) }}"
-                               download="{{ $file['download_name'] }}"
-                               class="block bg-gray-50 hover:bg-gray-100 border border-gray-200 px-4 py-3 rounded-lg transition-colors">
-                                <div class="flex items-center justify-between">
-                                    <span class="font-medium text-gray-700">📄 {{ $file['download_name'] }}</span>
-                                    <span class="text-sm text-gray-500">{{ $file['rate_count'] }} rates</span>
-                                </div>
-                            </a>
-                            @endif
-                        @endforeach
-                    </div>
-                </div>
-            </div>
-            @endif
 
             <!-- Back Button -->
             <div class="text-center">
@@ -171,48 +134,5 @@
         </div>
     </div>
 
-    <script>
-        const successFiles = @json($successFiles->values());
-
-        async function downloadAll() {
-            if ('showDirectoryPicker' in window) {
-                // File System Access API (Chrome/Edge)
-                try {
-                    const directoryHandle = await window.showDirectoryPicker();
-
-                    let successCount = 0;
-                    for (const file of successFiles) {
-                        try {
-                            const response = await fetch(`/extract/download/${file.output_filename}`);
-                            if (!response.ok) throw new Error('Download failed');
-
-                            const blob = await response.blob();
-                            const fileHandle = await directoryHandle.getFileHandle(file.download_name, {create: true});
-                            const writable = await fileHandle.createWritable();
-                            await writable.write(blob);
-                            await writable.close();
-
-                            successCount++;
-                        } catch (err) {
-                            console.error('Failed to download:', file.download_name, err);
-                        }
-                    }
-
-                    alert(`✅ ดาวน์โหลดไฟล์ทั้งหมดเรียบร้อยแล้ว! (${successCount}/${successFiles.length} ไฟล์)`);
-                } catch (err) {
-                    if (err.name === 'AbortError') {
-                        return; // User cancelled
-                    }
-                    console.error('Error:', err);
-                    alert('เกิดข้อผิดพลาด: ' + err.message);
-                }
-            } else {
-                // Fallback for Firefox/Safari
-                document.getElementById('downloadAllBtn').classList.add('hidden');
-                document.getElementById('fallbackMessage').classList.remove('hidden');
-                document.getElementById('individualDownloads').classList.remove('hidden');
-            }
-        }
-    </script>
 </body>
 </html>
