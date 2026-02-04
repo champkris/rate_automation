@@ -14,7 +14,10 @@ class RateExtractionService
         'auto' => 'Auto-detect from filename',
         'rcl' => 'RCL (FAK Rate)',
         'kmtc' => 'KMTC (Updated Rate)',
-        'pil' => 'PIL (Pacific International Lines)',
+        'pil_africa' => 'PIL - Africa',
+        'pil_intra_asia' => 'PIL - Intra Asia',
+        'pil_latin_america' => 'PIL - Latin America',
+        'pil_oceania' => 'PIL - Oceania',
         'sinokor' => 'SINOKOR (Main Rate Card)',
         'sinokor_skr' => 'SINOKOR SKR (HK Feederage)',
         'heung_a' => 'HEUNG A',
@@ -82,7 +85,12 @@ class RateExtractionService
         // Use .? to match optional space, underscore, or hyphen
         if (preg_match('/FAK.?RATE.?OF/i', $filename)) return 'rcl';
         if (preg_match('/UPDATED.?RATE/i', $filename)) return 'kmtc';
-        if (preg_match('/PIL.*QUOTATION|QUOTATION.*PIL|PIL.*(AFRICA|INTRA ASIA|LATIN AMERICA|OCEANIA|SOUTH ASIA)/i', $filename)) return 'pil';
+        // PIL region detection from filename
+        if (preg_match('/PIL.*(INTRA.?ASIA)/i', $filename)) return 'pil_intra_asia';
+        if (preg_match('/PIL.*(LATIN.?AMERICA)/i', $filename)) return 'pil_latin_america';
+        if (preg_match('/PIL.*(OCEANIA)/i', $filename)) return 'pil_oceania';
+        if (preg_match('/PIL.*(AFRICA)/i', $filename)) return 'pil_africa';
+        if (preg_match('/PIL.*QUOTATION|QUOTATION.*PIL/i', $filename)) return 'pil_africa'; // Default to Africa
         // Check SKR pattern before generic SINOKOR (SKR is the HK feederage table)
         if (preg_match('/SKR.*SINOKOR|SINOKOR.*SKR/i', $filename)) return 'sinokor_skr';
         // "GUIDE RATE FOR" with "(SKR)" or "_SKR_" is regular SINOKOR format (not feederage)
@@ -174,9 +182,13 @@ class RateExtractionService
         $content = implode("\n", array_slice($lines, 0, 30)); // Check first 30 lines
 
         // PIL signature: "Pacific International Lines" company name and trade regions
-        if (preg_match('/Pacific International Lines/i', $content) ||
-            preg_match('/Trade\s*:\s*(Africa|Intra Asia|Latin America|Oceania|South Asia)/i', $content)) {
-            return 'pil';
+        if (preg_match('/Pacific International Lines/i', $content)) {
+            // Try to detect specific region
+            if (preg_match('/Trade\s*:\s*Intra\s+Asia/i', $content)) return 'pil_intra_asia';
+            if (preg_match('/Trade\s*:\s*Latin\s+America/i', $content)) return 'pil_latin_america';
+            if (preg_match('/Trade\s*:\s*Oceania/i', $content)) return 'pil_oceania';
+            if (preg_match('/Trade\s*:\s*Africa/i', $content)) return 'pil_africa';
+            return 'pil_africa'; // Default to Africa if region unclear
         }
 
         // SITC signature: "Service Route" column header or SITC service codes (VTX, CKV, JTH)
@@ -380,7 +392,10 @@ class RateExtractionService
         }
 
         return match ($pattern) {
-            'pil' => $this->parsePilTable($lines, $validity),
+            'pil_africa' => $this->parsePilTable($lines, $validity),
+            'pil_intra_asia' => $this->parsePilTable($lines, $validity),
+            'pil_latin_america' => $this->parsePilTable($lines, $validity),
+            'pil_oceania' => $this->parsePilTable($lines, $validity),
             'sinokor' => $this->parseSinokorTable($lines, $validity),
             'sinokor_skr' => $this->parseSinokorSkrTable($lines, $validity),
             'heung_a' => $this->parseHeungATable($lines, $validity),

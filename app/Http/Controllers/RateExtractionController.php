@@ -115,13 +115,17 @@ class RateExtractionController extends Controller
                 $region = $this->getRegionFromRates($rates);
                 $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod, $region);
 
+                // Get display name from pattern label (for showing in UI, e.g., "PIL - Africa")
+                $patterns = $this->extractionService->getAvailablePatterns();
+                $carrierDisplayName = $patterns[$pattern] ?? $carrierName;
+
                 // Add to batch results
                 $batchFiles[] = [
                     'original_filename' => $originalName,
                     'temp_filename' => $filename,
                     'output_filename' => $outputFilename,
                     'download_name' => $downloadFilename,
-                    'carrier' => $carrierName,
+                    'carrier' => $carrierDisplayName,
                     'validity' => $validityPeriod,
                     'region' => $region,
                     'rate_count' => count($rates),
@@ -239,13 +243,17 @@ class RateExtractionController extends Controller
             $region = $this->getRegionFromRates($rates);
             $downloadFilename = $this->generateDownloadFilename($carrierName, $validityPeriod, $region);
 
+            // Get display name from pattern label (for showing in UI, e.g., "PIL - Africa")
+            $patterns = $this->extractionService->getAvailablePatterns();
+            $carrierDisplayName = $patterns[$pattern] ?? $carrierName;
+
             // Update batch file status to success
             $batchFiles[$fileIndex] = [
                 'original_filename' => $originalFilename,
                 'temp_filename' => $tempFilename,
                 'output_filename' => $outputFilename,
                 'download_name' => $downloadFilename,
-                'carrier' => $carrierName,
+                'carrier' => $carrierDisplayName,
                 'validity' => $validityPeriod,
                 'region' => $region,
                 'rate_count' => count($rates),
@@ -376,7 +384,10 @@ class RateExtractionController extends Controller
         $patternNames = [
             'rcl' => 'RCL',
             'kmtc' => 'KMTC',
-            'pil' => 'PIL',
+            'pil_africa' => 'PIL',
+            'pil_intra_asia' => 'PIL',
+            'pil_latin_america' => 'PIL',
+            'pil_oceania' => 'PIL',
             'sinokor' => 'SINOKOR',
             'sinokor_skr' => 'SINOKOR_SKR',
             'heung_a' => 'HEUNG_A',

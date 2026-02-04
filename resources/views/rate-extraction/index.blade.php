@@ -134,10 +134,10 @@
                     <div class="text-sm"><span class="font-medium">SM LINE</span></div>
                     <div class="text-sm"><span class="font-medium">DONGJIN</span></div>
                     <div class="text-sm"><span class="font-medium">TS LINE</span></div>
-                    <div class="text-sm"><span class="font-medium">PIL</span> - Africa</div>
-                    <div class="text-sm"><span class="font-medium">PIL</span> - Intra Asia</div>
-                    <div class="text-sm"><span class="font-medium">PIL</span> - Latin America</div>
-                    <div class="text-sm"><span class="font-medium">PIL</span> - Oceania</div>
+                    <div class="text-sm"><strong>PIL - Africa</strong></div>
+                    <div class="text-sm"><strong>PIL - Intra Asia</strong></div>
+                    <div class="text-sm"><strong>PIL - Latin America</strong></div>
+                    <div class="text-sm"><strong>PIL - Oceania</strong></div>
                 </div>
                 <p class="text-xs text-gray-500 mt-4">
                     <strong>Note:</strong> PDF files require pre-processed Azure OCR results. Excel files (.xlsx, .xls) are processed directly.
@@ -158,6 +158,9 @@
         const btnText = document.getElementById('btnText');
         const btnLoading = document.getElementById('btnLoading');
 
+        // Global DataTransfer for cumulative file accumulation
+        let accumulatedFiles = new DataTransfer();
+
         // Click to upload
         dropZone.addEventListener('click', () => fileInput.click());
 
@@ -176,34 +179,63 @@
             e.preventDefault();
             dropZone.classList.remove('border-blue-500', 'bg-blue-50');
             if (e.dataTransfer.files.length) {
-                fileInput.files = e.dataTransfer.files;
-                updateFileDisplay();
+                const newFiles = Array.from(e.dataTransfer.files);
+                addFilesToAccumulated(newFiles);
             }
         });
 
-        // File selection
-        fileInput.addEventListener('change', updateFileDisplay);
+        // File selection - cumulative
+        fileInput.addEventListener('change', function(e) {
+            const newFiles = Array.from(e.target.files);
+            addFilesToAccumulated(newFiles);
+        });
+
+        // Add files to accumulated list
+        function addFilesToAccumulated(newFiles) {
+            // Check total count
+            if (accumulatedFiles.files.length + newFiles.length > 15) {
+                alert(`Maximum 15 files allowed!\nCurrently selected: ${accumulatedFiles.files.length}\nTrying to add: ${newFiles.length}\n\nPlease remove some files first or select fewer files.`);
+                return;
+            }
+
+            // Add new files to accumulated list
+            newFiles.forEach(file => {
+                accumulatedFiles.items.add(file);
+            });
+
+            // Update the input's files
+            fileInput.files = accumulatedFiles.files;
+
+            // Update display
+            updateFileDisplay();
+
+            // Show success message
+            if (newFiles.length > 0) {
+                showToast(`${newFiles.length} file(s) added. Total: ${accumulatedFiles.files.length} / 15`);
+            }
+        }
 
         function updateFileDisplay() {
-            const files = fileInput.files;
+            const files = Array.from(accumulatedFiles.files);
 
             if (files.length > 0) {
-                // Validate max 15 files
-                if (files.length > 15) {
-                    alert('Maximum 15 files allowed. Please select fewer files.');
-                    fileInput.value = '';
-                    fileInfo.classList.remove('hidden');
-                    selectedFiles.classList.add('hidden');
-                    return;
-                }
-
                 // Count file types for progress estimation
                 let pdfCount = 0;
                 let excelCount = 0;
                 let totalSize = 0;
 
-                // Build file list HTML
-                let listHtml = '<div class="space-y-1">';
+                // Build file list HTML with delete buttons
+                let listHtml = '<div class="space-y-2">';
+
+                // Add "Clear All" button at top if there are files
+                if (files.length > 0) {
+                    listHtml += `<div class="flex justify-between items-center mb-2 pb-2 border-b border-gray-200">
+                        <span class="text-sm font-semibold text-gray-700">Selected Files (${files.length} / 15)</span>
+                        <button type="button" onclick="clearAllFiles()" class="text-sm text-red-600 hover:text-red-800 hover:underline">
+                            Clear All
+                        </button>
+                    </div>`;
+                }
 
                 for (let i = 0; i < files.length; i++) {
                     const file = files[i];
@@ -218,11 +250,21 @@
 
                     totalSize += file.size;
 
-                    // Add to list
+                    // Add to list with delete button
                     const icon = ext === 'pdf' ? '📄' : '📊';
-                    listHtml += `<div class="flex items-center justify-between px-2 py-1 bg-gray-50 rounded">
-                        <span class="text-gray-700">${icon} ${file.name}</span>
-                        <span class="text-gray-500">${formatFileSize(file.size)}</span>
+                    listHtml += `<div class="flex items-center justify-between px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 transition-colors">
+                        <div class="flex items-center flex-1 min-w-0 mr-3">
+                            <span class="mr-2">${icon}</span>
+                            <span class="text-sm text-gray-700 truncate" title="${file.name}">${file.name}</span>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <span class="text-xs text-gray-500">${formatFileSize(file.size)}</span>
+                            <button type="button" onclick="removeFile(${i})" class="text-red-500 hover:text-red-700 hover:bg-red-50 rounded p-1 transition-colors" title="Remove file">
+                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                                </svg>
+                            </button>
+                        </div>
                     </div>`;
                 }
 
@@ -270,8 +312,8 @@
             const pdfCount = counts.pdfCount || 0;
             const excelCount = counts.excelCount || 0;
 
-            // Calculate total estimated time (PDF=9s, Excel=4s)
-            const totalTime = (pdfCount * 9 + excelCount * 4) * 1000; // milliseconds
+            // Calculate total estimated time (PDF=12s, Excel=4s)
+            const totalTime = (pdfCount * 12 + excelCount * 4) * 1000; // milliseconds
 
             // Disable submit button and show loading
             submitBtn.disabled = true;
@@ -306,6 +348,56 @@
             // Allow form to submit normally
             return true;
         });
+
+        // Remove individual file
+        function removeFile(index) {
+            // Get current files as array
+            const files = Array.from(accumulatedFiles.files);
+
+            // Remove file at index
+            files.splice(index, 1);
+
+            // Rebuild DataTransfer object
+            accumulatedFiles = new DataTransfer();
+            files.forEach(file => {
+                accumulatedFiles.items.add(file);
+            });
+
+            // Update file input
+            fileInput.files = accumulatedFiles.files;
+
+            // Refresh display
+            updateFileDisplay();
+
+            // Show success message
+            showToast(`File removed. ${files.length} / 15 files selected.`);
+        }
+
+        // Clear all files
+        function clearAllFiles() {
+            if (accumulatedFiles.files.length === 0) return;
+
+            if (confirm('Remove all selected files?')) {
+                accumulatedFiles = new DataTransfer();
+                fileInput.files = accumulatedFiles.files;
+                updateFileDisplay();
+                showToast('All files cleared.');
+            }
+        }
+
+        // Toast notification helper
+        function showToast(message) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded-lg shadow-lg z-50 animate-fade-in';
+            toast.textContent = message;
+            document.body.appendChild(toast);
+
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transition = 'opacity 0.3s';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
     </script>
 </body>
 </html>
