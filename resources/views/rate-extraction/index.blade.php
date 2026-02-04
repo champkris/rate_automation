@@ -121,6 +121,10 @@
                     <div class="text-sm"><span class="font-medium">SM LINE</span></div>
                     <div class="text-sm"><span class="font-medium">DONGJIN</span></div>
                     <div class="text-sm"><span class="font-medium">TS LINE</span></div>
+                    <div class="text-sm"><span class="font-medium">PIL</span> - Africa</div>
+                    <div class="text-sm"><span class="font-medium">PIL</span> - Intra Asia</div>
+                    <div class="text-sm"><span class="font-medium">PIL</span> - Latin America</div>
+                    <div class="text-sm"><span class="font-medium">PIL</span> - Oceania</div>
                 </div>
                 <p class="text-xs text-gray-500 mt-4">
                     <strong>Note:</strong> PDF files require pre-processed Azure OCR results. Excel files (.xlsx, .xls) are processed directly.
