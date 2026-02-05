@@ -423,8 +423,15 @@ class RateExtractionController extends Controller
             'ial' => 'INTER_ASIA',
         ];
 
-        // If pattern is auto, detect from filename
+        // If pattern is auto, trust parsed rates data FIRST, then fall back to filename detection
         if ($pattern === 'auto') {
+            // Trust the parser's carrier detection first (most reliable)
+            $carrierFromRates = $this->getPrimaryCarrier($rates);
+            if ($carrierFromRates && $carrierFromRates !== 'UNKNOWN') {
+                return $carrierFromRates;
+            }
+
+            // Fall back to filename detection only if rates don't have carrier
             $filename = strtoupper($originalFilename);
 
             // Check specific carrier names FIRST (before generic patterns like FAK RATE)
@@ -450,8 +457,8 @@ class RateExtractionController extends Controller
             // "FAK Rate" without a specific carrier is RCL
             if (preg_match('/FAK.?RATE/i', $filename)) return 'RCL';
 
-            // Fall back to carrier from rates
-            return $this->getPrimaryCarrier($rates);
+            // Final fallback
+            return 'UNKNOWN';
         }
 
         return $patternNames[$pattern] ?? $this->getPrimaryCarrier($rates);
