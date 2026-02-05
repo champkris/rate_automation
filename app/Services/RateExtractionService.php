@@ -418,10 +418,10 @@ class RateExtractionService
         $rates = [];
         $highestRow = $worksheet->getHighestDataRow();
 
-        // Extract VALIDITY from cell B6 if not provided
+        // Extract VALIDITY from multiple possible cells if not provided
+        // RCL files may have validity in B6, B7, C6, or C7 depending on the format
         if (empty($validity)) {
-            $validityRaw = trim($worksheet->getCell('B6')->getValue() ?? '');
-            $validity = $this->formatValidity($validityRaw);
+            $validity = $this->findValidityInCells($worksheet, ['B6', 'B7', 'C6', 'C7']);
         }
 
         // Build merged cell values map
@@ -5674,6 +5674,10 @@ class RateExtractionService
 
     /**
      * Format validity date
+     * Handles multiple formats:
+     * - "01/11-30/11/2025" (DD/MM-DD/MM/YYYY) → "1-30 NOV 2025"
+     * - "01-15 Jan 2026" (DD-DD Mon YYYY) → "1-15 JAN 2026"
+     * - "'01-15 Jan 2026" (with Excel text prefix) → "1-15 JAN 2026"
      */
     protected function formatValidity(string $validityRaw): string
     {
@@ -5681,25 +5685,85 @@ class RateExtractionService
             return strtoupper(date('M Y'));
         }
 
+        // Remove leading apostrophe if present (Excel text format prefix)
+        $cleanedRaw = ltrim($validityRaw, "'");
+
         $months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-        if (strpos($validityRaw, '-') !== false) {
-            $parts = explode('-', $validityRaw);
-            $endDate = trim($parts[1]);
-            $dateParts = explode('/', $endDate);
+        // Format 1: "DD-DD Mon YYYY" (e.g., "01-15 Jan 2026", "1-15 Jan 2026")
+        if (preg_match('/^(\d{1,2})-(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*(\d{4})$/i', $cleanedRaw, $matches)) {
+            $startDay = intval($matches[1]);
+            $endDay = intval($matches[2]);
+            $month = strtoupper($matches[3]);
+            $year = $matches[4];
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
 
-            if (count($dateParts) >= 2) {
-                $day = intval($dateParts[0]);
-                $month = intval($dateParts[1]);
-                $year = isset($dateParts[2]) ? intval($dateParts[2]) : date('Y');
+        // Format 2: "DD/MM-DD/MM/YYYY" (e.g., "01/11-30/11/2025")
+        if (strpos($cleanedRaw, '-') !== false) {
+            $parts = explode('-', $cleanedRaw);
 
-                if ($month >= 1 && $month <= 12) {
-                    return sprintf('%02d %s %d', $day, $months[$month - 1], $year);
+            // Check if both parts have slashes (DD/MM format)
+            if (count($parts) >= 2 && strpos($parts[0], '/') !== false && strpos($parts[1], '/') !== false) {
+                $startParts = explode('/', trim($parts[0]));
+                $endParts = explode('/', trim($parts[1]));
+
+                if (count($startParts) >= 2 && count($endParts) >= 2) {
+                    $startDay = intval($startParts[0]);
+                    $endDay = intval($endParts[0]);
+                    $month = intval($endParts[1]);
+                    $year = isset($endParts[2]) ? intval($endParts[2]) : date('Y');
+
+                    if ($month >= 1 && $month <= 12) {
+                        return "{$startDay}-{$endDay} " . strtoupper($months[$month - 1]) . " {$year}";
+                    }
                 }
             }
         }
 
-        return $validityRaw;
+        // Return cleaned raw value (uppercase for consistency)
+        return strtoupper($cleanedRaw);
+    }
+
+    /**
+     * Find validity date by searching multiple cells
+     * Searches through given cell addresses and returns the first valid date found
+     *
+     * @param \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $worksheet
+     * @param array $cellAddresses Array of cell addresses to search (e.g., ['B6', 'B7', 'C6', 'C7'])
+     * @return string Formatted validity or current month as fallback
+     */
+    protected function findValidityInCells($worksheet, array $cellAddresses): string
+    {
+        // Date patterns to match:
+        // - "DD-DD Mon YYYY" (e.g., "01-15 Jan 2026", "'01-15 Jan 2026")
+        // - "DD/MM-DD/MM/YYYY" (e.g., "01/11-30/11/2025")
+        $datePatterns = [
+            '/^\d{1,2}-\d{1,2}\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{4}$/i',  // DD-DD Mon YYYY
+            '/^\d{1,2}\/\d{1,2}-\d{1,2}\/\d{1,2}\/\d{4}$/',  // DD/MM-DD/MM/YYYY
+        ];
+
+        foreach ($cellAddresses as $cellAddress) {
+            $cellValue = trim($worksheet->getCell($cellAddress)->getValue() ?? '');
+
+            // Remove leading apostrophe (Excel text format prefix)
+            $cleanedValue = ltrim($cellValue, "'");
+
+            if (empty($cleanedValue)) {
+                continue;
+            }
+
+            // Check if the cell contains a date pattern
+            foreach ($datePatterns as $pattern) {
+                if (preg_match($pattern, $cleanedValue)) {
+                    // Found a valid date, format and return it
+                    return $this->formatValidity($cleanedValue);
+                }
+            }
+        }
+
+        // Fallback: return current month
+        return strtoupper(date('M Y'));
     }
 
     /**
