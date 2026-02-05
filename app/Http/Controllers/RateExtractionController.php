@@ -151,6 +151,9 @@ class RateExtractionController extends Controller
 
         // Check if any files were processed
         if (empty($batchFiles)) {
+            if ($request->ajax() || $request->wantsJson()) {
+                return response()->json(['error' => 'No files could be processed. Please try again.']);
+            }
             return back()->with('error', 'No files could be processed. Please try again.');
         }
 
@@ -160,6 +163,16 @@ class RateExtractionController extends Controller
             'batch_timestamp' => $timestamp,
             'batch_patterns' => $this->extractionService->getAvailablePatterns() // For re-process dropdown
         ]);
+
+        // Return JSON for AJAX requests, redirect for normal requests
+        if ($request->ajax() || $request->wantsJson()) {
+            // Explicitly save session to release lock before redirect
+            session()->save();
+
+            // Force connection close to free up single-threaded dev server
+            return response()->json(['redirect' => route('rate-extraction.result')])
+                ->header('Connection', 'close');
+        }
 
         return redirect()->route('rate-extraction.result');
     }
@@ -284,8 +297,17 @@ class RateExtractionController extends Controller
                 ->with('error', 'File not found. Please extract again.');
         }
 
-        // Get the download filename from session or use default
-        $downloadFilename = session('download_filename', 'extracted_rates.xlsx');
+        // Get the download filename from batch_files session data
+        $downloadFilename = 'extracted_rates.xlsx'; // default fallback
+
+        // Extract index from filename (format: extracted_rates_{timestamp}_{index}.xlsx)
+        if (preg_match('/extracted_rates_\d+_(\d+)\.xlsx/', $filename, $matches)) {
+            $index = (int)$matches[1];
+            $batchFiles = session('batch_files', []);
+            if (isset($batchFiles[$index]['download_name'])) {
+                $downloadFilename = $batchFiles[$index]['download_name'];
+            }
+        }
 
         return response()->download($path, $downloadFilename, [
             'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

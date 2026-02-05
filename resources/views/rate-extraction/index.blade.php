@@ -330,9 +330,9 @@
 
             progressContainer.classList.remove('hidden');
 
-            // Animate progress bar to 95% over estimated time
+            // Animate progress bar to 90% over estimated time
             let progress = 0;
-            const maxProgress = 95;
+            const maxProgress = 90;
             const updateInterval = 100; // Update every 100ms
             const increment = (maxProgress / totalTime) * updateInterval;
 
@@ -348,8 +348,60 @@
                 progressText.textContent = Math.floor(progress) + '%';
             }, updateInterval);
 
-            // Allow form to submit normally
-            return true;
+            // Use AJAX submission for smoother progress animation
+            const formData = new FormData(uploadForm);
+
+            fetch(uploadForm.action, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                // Stop the progress animation
+                clearInterval(progressInterval);
+
+                // Smooth finish animation
+                const smoothFinish = async () => {
+                    // If progress < 90, jump to 90 first
+                    if (progress < 90) {
+                        progressBar.style.width = '90%';
+                        progressText.textContent = '90%';
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+
+                    // Move to 95%
+                    progressBar.style.width = '95%';
+                    progressText.textContent = '95%';
+                    await new Promise(r => setTimeout(r, 700));
+
+                    // Move to 100%
+                    progressBar.style.width = '100%';
+                    progressText.textContent = '100%';
+                    await new Promise(r => setTimeout(r, 300));
+
+                    // Redirect to results page (small delay to let server fully release)
+                    await new Promise(r => setTimeout(r, 100)); // Let server connection close
+                    if (data.redirect) {
+                        window.location.href = data.redirect;
+                    } else {
+                        window.location.href = '{{ route("rate-extraction.result") }}';
+                    }
+                };
+
+                smoothFinish();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                clearInterval(progressInterval);
+                // On error, redirect to show error message
+                window.location.href = '{{ route("rate-extraction.result") }}';
+            });
+
+            // Prevent normal form submission
+            return false;
         });
 
         // Remove individual file
