@@ -134,6 +134,7 @@
                     <div class="text-sm"><span class="font-medium">SM LINE</span></div>
                     <div class="text-sm"><span class="font-medium">DONGJIN</span></div>
                     <div class="text-sm"><span class="font-medium">TS LINE</span></div>
+                    <div class="text-sm"><span class="font-medium">INTER ASIA</span> - excel only</div>
                     <div class="text-sm"><strong>PIL - Africa</strong></div>
                     <div class="text-sm"><strong>PIL - Intra Asia</strong></div>
                     <div class="text-sm"><strong>PIL - Latin America</strong></div>
