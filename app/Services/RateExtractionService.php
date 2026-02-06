@@ -5860,6 +5860,23 @@ class RateExtractionService
             return "{$startDay}-{$endDay} {$month} {$year}";
         }
 
+        // Pattern: "01-31'December 2025" or "01-30'November 2025" (SITC format - apostrophe + full month name)
+        if (preg_match('/(\d{1,2})[-–]\s*(\d{1,2})\W?\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i', $content, $matches)) {
+            $startDay = $matches[1];
+            $endDay = $matches[2];
+            $monthFull = strtoupper($matches[3]);
+            $year = $matches[4];
+
+            $monthMap = [
+                'JANUARY' => 'JAN', 'FEBRUARY' => 'FEB', 'MARCH' => 'MAR', 'APRIL' => 'APR',
+                'MAY' => 'MAY', 'JUNE' => 'JUN', 'JULY' => 'JUL', 'AUGUST' => 'AUG',
+                'SEPTEMBER' => 'SEP', 'OCTOBER' => 'OCT', 'NOVEMBER' => 'NOV', 'DECEMBER' => 'DEC'
+            ];
+            $month = $monthMap[$monthFull] ?? $monthFull;
+
+            return "{$startDay}-{$endDay} {$month} {$year}";
+        }
+
         // Pattern 4: "OF 1 - 15 Nov. 25" or "1-15 Nov 25" (TS LINE format)
         if (preg_match('/(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*[\'`]?(\d{2,4})/i', $content, $matches)) {
             $startDay = $matches[1];
