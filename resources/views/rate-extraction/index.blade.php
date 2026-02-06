@@ -122,18 +122,18 @@
             <div class="mt-8 bg-white rounded-lg shadow-md p-6">
                 <h2 class="text-lg font-bold text-gray-800 mb-4">Supported Carriers</h2>
                 <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
-                    <div class="text-sm"><span class="font-medium">RCL</span> - FAK Rate</div>
-                    <div class="text-sm"><span class="font-medium">KMTC</span> - Updated Rate</div>
-                    <div class="text-sm"><span class="font-medium">SINOKOR</span> - Main Rate Card</div>
-                    <div class="text-sm"><span class="font-medium">SINOKOR SKR</span> - HK Feederage</div>
-                    <div class="text-sm"><span class="font-medium">HEUNG A</span></div>
+                    <div class="text-sm"><span class="font-medium">RCL</span></div>
+                    <div class="text-sm"><span class="font-medium">KMTC</span></div>
+                    <div class="text-sm"><span class="font-medium">SINOKOR</span></div>
+                    <div class="text-sm"><span class="font-medium">SINOKOR SKR</span></div>
+                    <div class="text-sm"><span class="font-medium">HEUNG A</span> <span class="text-orange-500 text-xs">* need file name</span></div>
                     <div class="text-sm"><span class="font-medium">BOXMAN</span></div>
                     <div class="text-sm"><span class="font-medium">SITC</span></div>
-                    <div class="text-sm"><span class="font-medium">WANHAI</span> - India Rate</div>
+                    <div class="text-sm"><span class="font-medium">WANHAI</span> <span class="text-orange-500 text-xs">* need file name</span></div>
                     <div class="text-sm"><span class="font-medium">CK LINE</span></div>
-                    <div class="text-sm"><span class="font-medium">SM LINE</span></div>
+                    <div class="text-sm"><span class="font-medium">SM LINE</span> <span class="text-orange-500 text-xs">* need file name</span></div>
                     <div class="text-sm"><span class="font-medium">DONGJIN</span></div>
-                    <div class="text-sm"><span class="font-medium">TS LINE</span></div>
+                    <div class="text-sm"><span class="font-medium">TS LINE</span> <span class="text-orange-500 text-xs">* need file name</span></div>
                     <div class="text-sm"><span class="font-medium">INTER ASIA</span> - excel only</div>
                     <div class="text-sm"><strong>PIL - Africa</strong></div>
                     <div class="text-sm"><strong>PIL - Intra Asia</strong></div>
