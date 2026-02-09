@@ -418,11 +418,15 @@ class RateExtractionService
         $rates = [];
         $highestRow = $worksheet->getHighestDataRow();
 
+        \Log::info("parseRclExcel: ENTERED, validity param='{$validity}', empty=" . (empty($validity) ? 'YES' : 'NO'));
+
         // Extract VALIDITY from multiple possible cells if not provided
         // RCL files may have validity in B6, B7, C6, or C7 depending on the format
         if (empty($validity)) {
             $validity = $this->findValidityInCells($worksheet, ['B6', 'B7', 'C6', 'C7']);
         }
+
+        \Log::info("parseRclExcel: after findValidityInCells, validity='{$validity}'");
 
         // Build merged cell values map
         $mergedCellValues = $this->buildMergedCellMap($worksheet);
@@ -5738,9 +5742,11 @@ class RateExtractionService
         // Date patterns to match:
         // - "DD-DD Mon YYYY" (e.g., "01-15 Jan 2026", "'01-15 Jan 2026")
         // - "DD/MM-DD/MM/YYYY" (e.g., "01/11-30/11/2025")
+        // - "DD/MM-DD/MM" (e.g., "01/11-15/11" - no year)
         $datePatterns = [
             '/^\d{1,2}-\d{1,2}\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{4}$/i',  // DD-DD Mon YYYY
             '/^\d{1,2}\/\d{1,2}-\d{1,2}\/\d{1,2}\/\d{4}$/',  // DD/MM-DD/MM/YYYY
+            '/^\d{1,2}\/\d{1,2}-\d{1,2}\/\d{1,2}$/',  // DD/MM-DD/MM (no year)
         ];
 
         foreach ($cellAddresses as $cellAddress) {
@@ -5749,19 +5755,26 @@ class RateExtractionService
             // Remove leading apostrophe (Excel text format prefix)
             $cleanedValue = ltrim($cellValue, "'");
 
+            \Log::info("findValidityInCells: cell={$cellAddress}, raw='{$cellValue}', cleaned='{$cleanedValue}'");
+
             if (empty($cleanedValue)) {
                 continue;
             }
 
             // Check if the cell contains a date pattern
             foreach ($datePatterns as $pattern) {
-                if (preg_match($pattern, $cleanedValue)) {
+                $matched = preg_match($pattern, $cleanedValue);
+                \Log::info("findValidityInCells: pattern={$pattern}, matched={$matched}");
+                if ($matched) {
                     // Found a valid date, format and return it
-                    return $this->formatValidity($cleanedValue);
+                    $result = $this->formatValidity($cleanedValue);
+                    \Log::info("findValidityInCells: formatValidity result='{$result}'");
+                    return $result;
                 }
             }
         }
 
+        \Log::info("findValidityInCells: no match found, falling back to current month");
         // Fallback: return current month
         return strtoupper(date('M Y'));
     }
