@@ -4021,8 +4021,8 @@ class RateExtractionService
         $rates = [];
 
         foreach ($lines as $line) {
-            // Skip headers and non-data rows
-            if (preg_match('/^TABLE \d+|^-{10,}|^Row [01]:|COUNTRY|POD.*DESTINATION|OUTBOUND|INBOUND|THC|B\/L|SEAL|CFS|D\/O|Container|DEPOSIT|CLEANING/i', $line)) {
+            // Skip non-row lines (table headers, separators)
+            if (preg_match('/^TABLE \d+|^-{10,}|^Row [01]:/i', $line)) {
                 continue;
             }
 
@@ -4033,6 +4033,15 @@ class RateExtractionService
 
             $rowData = $matches[1];
             $cells = array_map('trim', explode('|', $rowData));
+
+            // Skip non-rate rows by checking only the first 3 cells (COUNTRY/POD area)
+            // Azure OCR merges the rate table and local charges table side-by-side into one wide row,
+            // so keywords like THC, B/L, SEAL etc. appear in cells[7+] for valid rate rows.
+            // Only skip if these keywords appear in the first 3 cells (meaning it's a real charges row).
+            $firstCells = implode(' | ', array_slice($cells, 0, 3));
+            if (preg_match('/COUNTRY|POD.*DESTINATION|OUTBOUND|INBOUND|THC|B\/L|SEAL|CFS|D\/O|Container|DEPOSIT|CLEANING/i', $firstCells)) {
+                continue;
+            }
 
             // Need at least 5 cells for valid rate row
             if (count($cells) < 5) continue;
