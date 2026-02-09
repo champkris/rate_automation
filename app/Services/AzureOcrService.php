@@ -602,11 +602,22 @@ class AzureOcrService
                     $row = $cell['rowIndex'] ?? 0;
                     $col = $cell['columnIndex'] ?? 0;
                     $content = $cell['content'] ?? '';
+                    $rowSpan = $cell['rowSpan'] ?? 1;
 
                     if (!isset($cells[$row])) {
                         $cells[$row] = [];
                     }
                     $cells[$row][$col] = $content;
+
+                    // If cell spans multiple rows, copy to subsequent rows
+                    for ($r = 1; $r < $rowSpan; $r++) {
+                        if (!isset($cells[$row + $r])) {
+                            $cells[$row + $r] = [];
+                        }
+                        if (!isset($cells[$row + $r][$col])) {
+                            $cells[$row + $r][$col] = $content;
+                        }
+                    }
 
                     // Track which pages have table cells
                     if (isset($cell['boundingRegions'])) {

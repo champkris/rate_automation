@@ -418,15 +418,11 @@ class RateExtractionService
         $rates = [];
         $highestRow = $worksheet->getHighestDataRow();
 
-        \Log::info("parseRclExcel: ENTERED, validity param='{$validity}', empty=" . (empty($validity) ? 'YES' : 'NO'));
-
         // Extract VALIDITY from multiple possible cells if not provided
         // RCL files may have validity in B6, B7, C6, or C7 depending on the format
         if (empty($validity)) {
             $validity = $this->findValidityInCells($worksheet, ['B6', 'B7', 'C6', 'C7']);
         }
-
-        \Log::info("parseRclExcel: after findValidityInCells, validity='{$validity}'");
 
         // Build merged cell values map
         $mergedCellValues = $this->buildMergedCellMap($worksheet);
@@ -3707,20 +3703,33 @@ class RateExtractionService
             $rate20Clean = preg_replace('/[^0-9]/', '', $rate20);
             $rate40Clean = preg_replace('/[^0-9]/', '', $rate40);
 
-            // Special handling for SHEKOU: OCR often misses rate columns
-            // Row format: Shekou |  | USD |  | 6 | Direct | FRI | Sat
-            // The "6" is T/T days, not a rate. SHEKOU should have same rates as NANSHA.
+            // SHEKOU handling: rates may come from rowSpan expansion (merged cells with NANSHA)
+            // Three cases:
+            //   1) Both 20' and 40' valid → use as-is (full rowSpan or future un-merged)
+            //   2) 20' valid but 40' invalid → partial rowSpan, copy 40' from NANSHA
+            //   3) 20' invalid → full fallback, copy both from NANSHA
             $podUpper = strtoupper(trim($pod));
-            if ($podUpper === 'SHEKOU' && (empty($rate20Clean) || strlen($rate20Clean) < 2)) {
-                // Use NANSHA rates (20, 30 for 20' and 40')
-                $rate20Clean = '20';
-                $rate40Clean = '30';
-                $tt = '6';
-                $ts = 'Direct';
-                // Find ETD values in remaining cells
+            $shekou20Valid = !empty($rate20Clean) && strlen($rate20Clean) >= 2;
+            $shekou40Valid = !empty($rate40Clean) && strlen($rate40Clean) >= 2;
+
+            if ($podUpper === 'SHEKOU' && (!$shekou20Valid || !$shekou40Valid)) {
+                // Copy missing rates from NANSHA (last known rates)
+                if (!$shekou20Valid) {
+                    $rate20Clean = $lastRate20;
+                }
+                if (!$shekou40Valid) {
+                    $rate40Clean = $lastRate40;
+                }
+                // T/T and ETD parsing is unreliable when columns shifted, handle manually
+                $tt = '';
+                $ts = '';
                 for ($i = $usdPos + 1; $i < count($cells); $i++) {
                     $cellVal = trim($cells[$i]);
-                    if (preg_match('/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i', $cellVal)) {
+                    if (empty($tt) && preg_match('/\d+.*day|^\d+$/i', $cellVal)) {
+                        $tt = $cellVal;
+                    } elseif (empty($ts) && preg_match('/^(Direct|NANSHA|PUS)/i', $cellVal)) {
+                        $ts = $cellVal;
+                    } elseif (preg_match('/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i', $cellVal)) {
                         if (empty($etdBkk)) {
                             $etdBkk = $cellVal;
                         } else {
@@ -5755,26 +5764,19 @@ class RateExtractionService
             // Remove leading apostrophe (Excel text format prefix)
             $cleanedValue = ltrim($cellValue, "'");
 
-            \Log::info("findValidityInCells: cell={$cellAddress}, raw='{$cellValue}', cleaned='{$cleanedValue}'");
-
             if (empty($cleanedValue)) {
                 continue;
             }
 
             // Check if the cell contains a date pattern
             foreach ($datePatterns as $pattern) {
-                $matched = preg_match($pattern, $cleanedValue);
-                \Log::info("findValidityInCells: pattern={$pattern}, matched={$matched}");
-                if ($matched) {
+                if (preg_match($pattern, $cleanedValue)) {
                     // Found a valid date, format and return it
-                    $result = $this->formatValidity($cleanedValue);
-                    \Log::info("findValidityInCells: formatValidity result='{$result}'");
-                    return $result;
+                    return $this->formatValidity($cleanedValue);
                 }
             }
         }
 
-        \Log::info("findValidityInCells: no match found, falling back to current month");
         // Fallback: return current month
         return strtoupper(date('M Y'));
     }
